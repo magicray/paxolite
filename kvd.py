@@ -1,8 +1,5 @@
-import os
 import json
 import time
-import signal
-import socket
 import sqlite3
 import asyncio
 import argparse
@@ -25,22 +22,31 @@ def db_connect(db):
     return conn
 
 
+def gather_info(req):
+    db = db_connect(req['db'])
+
+    row = db.execute('''select log_seq, promise_seq from paxos_kv
+                        order by log_seq desc limit 1''').fetchone()
+
+    next_log_seq = 1
+
+    if row:
+        next_log_seq = row[0]+1 if row[1] == MAX_SEQ else row[0]
+
+    req.update(dict(status='ok', next_log_seq=next_log_seq))
+
+    return req
+
+
 def paxos_promise(req):
     db = db_connect(req['db'])
 
-    row = db.execute('''select log_seq, promise_seq
-                        from paxos_kv
-                        order by log_seq desc limit 1
-                    ''').fetchone()
+    row = db.execute('select * from paxos_kv where log_seq=?',
+                     (req['log_seq'],)).fetchone()
 
-    # Either we are just getting started and db is empty.
-    # Or, the row for largest log_seq has been already learned,
-    # and we create a new row for the next log entry
-    if not row or row[1] == MAX_SEQ:
-        req.update(dict(
-            status='ok',
-            log_seq=1 if not row else row[0]+1))
-
+    # Insert a new row
+    if not row:
+        req['status'] = 'ok'
         db.execute('insert into paxos_kv(log_seq, promise_seq) values(?, ?)',
                    (req['log_seq'], req['promise_seq']))
         db.commit()
@@ -50,7 +56,6 @@ def paxos_promise(req):
     if req['promise_seq'] <= row[1]:
         req.update(dict(
             status='OutdatedPromiseSeq',
-            log_seq=row[0],
             existing_promise_seq=row[1]))
 
         return req
@@ -58,15 +63,12 @@ def paxos_promise(req):
     # Our promise_seq is largest seen so far for this log_seq.
     # Update promise_seq and return current accepted values
     db.execute('update paxos_kv set promise_seq=? where log_seq=?',
-               (req['promise_seq'], row[0]))
-
-    row = db.execute('select * from paxos_kv where log_seq=?',
-                     (row[0],)).fetchone()
+               (req['promise_seq'], req['log_seq']))
     db.commit()
 
     req.update(dict(
-        status='ok', log_seq=row[0],
-        promise_seq=row[1], accept_seq=row[2],
+        status='ok',
+        existing_promise_seq=row[1], accept_seq=row[2],
         key=row[3], value=row[4]))
 
     return req
@@ -78,50 +80,54 @@ def paxos_accept(req):
     row = db.execute('select * from paxos_kv where log_seq=?',
                      (req['log_seq'],)).fetchone()
 
-    # Our promise_seq is less than the existing seq. Terminate.
-    if row and req['promise_seq'] < row[1]:
-        req.update(dict(status='OutdatedPromiseSeq'))
+    # We did not participate in the promise phase. Terminate.
+    # This is stricter than what paxos asks. Less code/test we like
+    # A new entry is created only in the promise phase. Easy to reason.
+    if not row:
+        req['status'] = 'NotFound'
         return req
 
-    # No entry for this log_seq found. No conflicts. Accept.
-    if not row:
-        row = (log_seq, 0, 0, None, None)
-        db.execute('insert into paxos_kv values(?,?,?,?,?)',
-                   (req['log_seq'], req['promise_seq'], req['promise_seq'],
-                    req['key'], value))
+    # This is a different flow as promise_seq does not match. Terminate.
+    # This is stricter than what paxos says. We accept only if we promised.
+    # Less code and easy to reason. And not a violation of paxos protocol.
+    if req['promise_seq'] != row[1]:
+        req['status'] = 'PromiseSeqMismatch'
+        return req
 
-    # Our promise_seq is greater or equal to existing value. Accept.
-    else:
-        db.execute('''update paxos_kv
-                      set promise_seq=?, accept_seq=?, data_key=?, data_value=?
-                      where log_seq=?
-                   ''', (req['promise_seq'], req['promise_seq'], req['key'],
-                         req['value'], req['log_seq']))
+    db.execute('''update paxos_kv
+                  set accept_seq=?, data_key=?, data_value=?
+                  where log_seq=?
+               ''', (req['promise_seq'], req['key'],
+                     req.pop('value'), req['log_seq']))
 
     db.commit()
 
-    req.pop('value')
-    req.update(dict(status='ok',
-        existing_promise_seq=row[1], existing_accept_seq=row[2],
-        existing_key=row[3]))
+    req['status'] = 'ok'
     return req
 
 
 def paxos_learn(req):
     db = db_connect(req['db'])
 
-    key = db.execute('select data_key from paxos_kv where log_seq=?',
-                     (req['log_seq'],)).fetchone()[0]
-    db.execute('delete from paxos_kv where data_key=? and log_seq<?',
-               (key, req['log_seq']))
-    db.execute('''update paxos_kv set promise_seq=?, accept_seq=?
-                  where log_seq=? and promise_seq=? and accept_seq=? and
-                        data_key is not null and data_value is not null
-               ''', (MAX_SEQ, MAX_SEQ, req['log_seq'],
-                     req['promise_seq'], req['promise_seq']))
+    row = db.execute('''select data_key from paxos_kv
+                        where log_seq=? and promise_seq=? and accept_seq=?
+                     ''', (req['log_seq'], req['promise_seq'],
+                           req['promise_seq'])).fetchone()
+    if not row:
+        req['status'] = 'NotFound'
+        return req
+
+    db.execute('delete from paxos_kv where log_seq<? and data_key=?',
+               (req['log_seq'], row[0]))
+
+    db.execute('''update paxos_kv set
+                  promise_seq=?, accept_seq=?
+                  where log_seq=?
+               ''', (MAX_SEQ, MAX_SEQ, req['log_seq']))
+
     db.commit()
 
-    req['status'] ='ok'
+    req['status'] = 'ok'
     return req
 
 
@@ -162,37 +168,56 @@ async def paxos_propose(key, value):
     quorum = int(len(servers)/2) + 1
 
     count = 0
-    log_seq = set()
-    req_map = {s: dict(action='promise', db=db, promise_seq=promise_seq)
-               for s in servers}
+    log_seq = 1
+    req_map = {s: dict(action='info', db=db) for s in servers}
     for res in await multi_rpc(req_map):
-        print(res)
-        if type(res) is not dict:
+        if type(res) is not dict or 'ok' != res['status']:
             continue
 
-        if 'ok' == res['status']:
-            count += 1
+        print(res)
+        count += 1
 
-        log_seq.add(res['log_seq'])
+        if res['next_log_seq'] > log_seq:
+            log_seq = res['next_log_seq']
 
-    if count < quorum or len(log_seq) != 1:
+    if count < quorum:
+        log('NoQuorum(info)')
         return
 
-    log_seq = log_seq.pop()
+    count = 0
+    accepted_seq = 0
+    proposal_value = (key, value)
+    req_map = {s: dict(action='promise', db=db,
+                       log_seq=log_seq, promise_seq=promise_seq)
+               for s in servers}
+    for res in await multi_rpc(req_map):
+        if type(res) is not dict or 'ok' != res['status']:
+            continue
+
+        print(res)
+        count += 1
+
+        if res.get('accepted_seq', 0) > accepted_seq:
+            proposal_value = (res['key'], res['value'])
+
+    if count < quorum:
+        log('NoQuorum(promise)')
+        return
 
     count = 0
     req_map = {s: dict(action='accept', db=db, promise_seq=promise_seq,
-                       log_seq=log_seq, key=key, value=value)
+                       log_seq=log_seq,
+                       key=proposal_value[0], value=proposal_value[1])
                for s in servers}
     for res in await multi_rpc(req_map):
-        print(res)
-        if type(res) is not dict:
+        if type(res) is not dict or 'ok' != res['status']:
             continue
 
-        if 'ok' == res['status']:
-            count += 1
+        print(res)
+        count += 1
 
     if count < quorum:
+        log('NoQuorum(accept)')
         return
 
     count = 0
@@ -200,14 +225,14 @@ async def paxos_propose(key, value):
                        log_seq=log_seq)
                for s in servers}
     for res in await multi_rpc(req_map):
-        print(res)
-        if type(res) is not dict:
+        if type(res) is not dict or 'ok' != res['status']:
             continue
 
-        if 'ok' == res['status']:
-            count += 1
+        print(res)
+        count += 1
 
     if count < quorum:
+        log('NoQuorum(learn)')
         return
 
     return True
@@ -221,7 +246,9 @@ async def server(reader, writer):
     if value:
         req['value'] = await reader.read(value)
 
-    if 'promise' == req['action']:
+    if 'info' == req['action']:
+        res = gather_info(req)
+    elif 'promise' == req['action']:
         res = paxos_promise(req)
     elif 'accept' == req['action']:
         res = paxos_accept(req)
@@ -248,7 +275,7 @@ def client(args):
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--port', dest='port', type=int)
-    args.add_argument('--maxsize', dest='maxsize', type=int, default=10*1024*1024)
+    args.add_argument('--maxsize', dest='maxsize', type=int, default=1024*1024)
     args = args.parse_args()
 
     if args.port:
