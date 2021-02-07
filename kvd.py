@@ -89,6 +89,11 @@ def insert_row(req):
         req['status'] = 'InvalidLogSeq'
         return req
 
+    if not req['key'] or not req['value']:
+        log('BUG - This should never happen(%s)', req)
+        req['status'] = 'InvalidKeyValue'
+        return req
+
     db.execute('''delete from paxos
                   where log_seq=? and (promise_seq!=? or accept_seq!=?)
                ''', (next_log_seq, MAX_SEQ, MAX_SEQ))
@@ -169,6 +174,11 @@ def paxos_accept(req):
         req['status'] = 'PromiseSeqMismatch'
         return req
 
+    if not req['key'] or not req['value']:
+        log('BUG - This should never happen(%s)', req)
+        req['status'] = 'InvalidKeyValue'
+        return req
+
     # All good. Our promise_seq is same as in the db.
     db.execute('''update paxos set accept_seq=?, data_key=?, data_value=?
                   where log_seq=?
@@ -214,7 +224,7 @@ async def _rpc(server, req):
     if value:
         req['value'] = len(value)
 
-    log('server%s request(%s)', server, req)
+    # log('server%s request(%s)', server, req)
     writer.write(json.dumps(req).encode())
     writer.write(b'\n')
     if value:
@@ -224,13 +234,13 @@ async def _rpc(server, req):
 
     res = json.loads((await reader.readline()).decode())
 
+    log('server%s response(%s)', server, res)
     value = res.pop('value', None)
     if value:
         res['value'] = await reader.read(value)
 
     writer.close()
 
-    log('server%s response(%s)', server, res)
     res['__server__'] = server
     return res
 
@@ -252,7 +262,7 @@ async def paxos_propose(servers, db, key, value):
     # Get the best log_seq to be used
     responses = await rpc({s: dict(action='info', db=db) for s in servers})
     if len(responses) < quorum:
-        return 'NoQuorum'
+        return 'NoInfoQuorum'
 
     min_srv, min_seq = None, 2**64   # This server is lagging behind
     log_srv, log_seq = None, 0       # This server has the most data
@@ -298,7 +308,7 @@ async def paxos_propose(servers, db, key, value):
                                    promise_seq=promise_seq)
                            for s in responses})
     if len(responses) < quorum:
-        return 'NoQuorum'
+        return 'NoPromiseQuorum'
 
     accepted_seq = 0
     proposal_value = (key, value)
@@ -316,7 +326,7 @@ async def paxos_propose(servers, db, key, value):
                                    value=proposal_value[1])
                            for s in responses})
     if len(responses) < quorum:
-        return 'NoQuorum'
+        return 'NoAcceptQuorum'
 
     # Paxos - Learn Phase
     responses = await rpc({s: dict(action='learn',
@@ -324,7 +334,7 @@ async def paxos_propose(servers, db, key, value):
                                    promise_seq=promise_seq)
                            for s in responses})
     if len(responses) < quorum:
-        return 'NoQuorum'
+        return 'NoLearnQuorum'
 
     # Our proposal was accepted
     if 0 == accepted_seq:
@@ -345,7 +355,7 @@ async def server(reader, writer):
     if value:
         req['value'] = await reader.read(value)
 
-    log('client%s request(%s)', writer.get_extra_info('peername'), req)
+    # log('client%s request(%s)', writer.get_extra_info('peername'), req)
 
     if 'info' == req['action']:
         res = read_info(req)
@@ -386,11 +396,15 @@ async def read_value(servers, db, key):
     if len(responses) < quorum:
         return 'NoQuorum'
 
+    log_seq, log_srv = 0, None
     for srv, res in responses.items():
         res = await rpc({srv: dict(action='read', db=db,
                         log_seq=res['log_seq'])})
-        if res:
-            return res[srv]['value'].decode()
+        if res and res[srv]['log_seq'] > log_seq:
+            log_srv = srv
+
+    if log_srv:
+        return res[log_srv]['value'].decode()
 
 
 def client():
@@ -398,8 +412,14 @@ def client():
                for s in ARGS.servers.split(',')]
 
     if ARGS.value or ARGS.file:
+        if ARGS.file:
+            with open(ARGS.file, 'rb') as fd:
+                value = fd.read()
+        else:
+            value = ARGS.value.encode()
+
         return asyncio.get_event_loop().run_until_complete(
-            paxos_propose(servers, ARGS.db, ARGS.key, ARGS.value.encode()))
+            paxos_propose(servers, ARGS.db, ARGS.key, value))
     else:
         return asyncio.get_event_loop().run_until_complete(
             read_value(servers, ARGS.db, ARGS.key))
