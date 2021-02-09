@@ -1,5 +1,5 @@
-# paxolite
-PaxoLite - Replicated key value store using paxos for replication and sqlite for storage
+# PaxoLite
+Replicated key value store using paxos for replication and sqlite for storage
 
 ## Design
 PaxoLite inserts data in a log. LogSeq number is chosen in strictly increasing order. Cluster reaches consensus for each LogSeq using paxos. Data for each LogSeq consists of a key and a value. After a LogSeq entry is learned, all the previous rows for that key are deleted.
