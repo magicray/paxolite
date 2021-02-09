@@ -8,26 +8,35 @@ import argparse
 from logging import critical as log
 
 
-signal.alarm(int(time.time()) % 30)
 MAX_SEQ = 99999999999999
 
 
+class cache():
+    log = dict()
+    key = dict()
+
+
 class SQLite():
+    conns = dict()
+
     def __init__(self, db):
-        self.conn = sqlite3.connect(db + '.sqlite3')
-        self.conn.execute('''create table if not exists paxos(
-            log_seq     unsigned integer primary key,
-            promise_seq unsigned integer,
-            accept_seq  unsigned integer,
-            data_key    text,
-            data_value  blob)''')
-        self.conn.execute('create index if not exists i1 on paxos(data_key)')
+        if db not in self.conns:
+            conn = sqlite3.connect(db + '.sqlite3')
+            conn.execute('''create table if not exists paxos(
+                log_seq     unsigned integer primary key,
+                promise_seq unsigned integer,
+                accept_seq  unsigned integer,
+                data_key    text,
+                data_value  blob)''')
+            conn.execute('create index if not exists i1 on paxos(data_key)')
+
+            self.conns[db] = conn
+
+        self.conn = self.conns[db]
+        self.conn.rollback()
 
         self.commit = self.conn.commit
         self.execute = self.conn.execute
-
-    def __del__(self):
-        self.conn.close()
 
 
 def get_next_log_seq(db):
@@ -48,23 +57,34 @@ def read_info(req):
 
 
 def read_key(req):
-    db = SQLite(req['db'])
+    if req['key'] not in cache.key:
+        db = SQLite(req['db'])
 
-    rows = db.execute('''select log_seq, promise_seq, accept_seq from paxos
-                         where data_key=? order by log_seq desc
-                      ''', (req['key'],)).fetchall()
-    assert(len(rows) <= 2)
+        rows = db.execute('select * from paxos where data_key=?',
+                          (req['key'],)).fetchall()
+
+        assert(len(rows) <= 2)
+
+        for row in rows:
+            if MAX_SEQ == row[1] and MAX_SEQ == row[2]:
+                cache.key[req['key']] = row[0]
+                cache.log[row[0]] = (row[3], row[4])
 
     req['status'] = 'NotFound'
-
-    for row in rows:
-        if MAX_SEQ == row[1] and MAX_SEQ == row[2]:
-            req.update(dict(status='ok', log_seq=row[0]))
+    if req['key'] in cache.key:
+        req.update(dict(status='ok', log_seq=cache.key[req['key']]))
 
     return req
 
 
 def read_row(req):
+    if req['log_seq'] in cache.log:
+        key, value = cache.log[req['log_seq']]
+
+        req.update(dict(status='ok', promise_seq=MAX_SEQ, accept_seq=MAX_SEQ,
+                        key=key, value=value))
+        return req
+
     db = SQLite(req['db'])
 
     row = db.execute('select * from paxos where log_seq=?',
@@ -102,6 +122,9 @@ def insert_row(req):
     db.execute('insert into paxos values(?,?,?,?,?)', (req['log_seq'],
                MAX_SEQ, MAX_SEQ, req['key'], req['value']))
     db.commit()
+
+    # Clear the cache
+    cache.log.pop(cache.key.pop(req['key'], 0), None)
 
     req['status'] = 'ok'
     return req
@@ -212,6 +235,9 @@ def paxos_learn(req):
                (MAX_SEQ, MAX_SEQ, req['log_seq']))
 
     db.commit()
+
+    # Clear the cache
+    cache.log.pop(cache.key.pop(row[0], 0), None)
 
     req['status'] = 'ok'
     return req
@@ -431,6 +457,7 @@ if __name__ == '__main__':
     ARGS = argparse.ArgumentParser()
     ARGS.add_argument('--db', dest='db', default='paxos')
     ARGS.add_argument('--port', dest='port', type=int)
+    ARGS.add_argument('--timeout', dest='timeout', type=int, default=30)
     ARGS.add_argument('--key', dest='key',
                       default=time.strftime('%Y%m%d%H%M%S'))
     ARGS.add_argument('--value', dest='value',
@@ -442,6 +469,7 @@ if __name__ == '__main__':
     ARGS = ARGS.parse_args()
 
     if ARGS.port:
+        signal.alarm(int(time.time()*1000) % ARGS.timeout)
         ARGS.clients = [ip.strip() for ip in ARGS.clients.split(',')]
         asyncio.ensure_future(asyncio.start_server(server, '', ARGS.port))
         log('listening on port(%s)', ARGS.port)
