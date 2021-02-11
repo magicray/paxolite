@@ -1,0 +1,8 @@
+#!/bin/bash
+
+echo ---------- 1 ----------
+sqlite3 1/paxolite.db 'select * from paxos order by log_seq desc limit 2'
+echo ---------- 2 ----------
+sqlite3 2/paxolite.db 'select * from paxos order by log_seq desc limit 2'
+echo ---------- 3 ----------
+sqlite3 3/paxolite.db 'select * from paxos order by log_seq desc limit 2'
