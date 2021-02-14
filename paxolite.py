@@ -9,6 +9,7 @@ from logging import critical as log
 
 
 DB = None
+LOCK = asyncio.Lock()
 
 
 class cache():
@@ -219,12 +220,50 @@ async def sync():
 
 
 async def server(reader, writer):
+    line = await reader.readline()
+    method = line.decode().split(' ')[0].lower()
+
+    # HTTP Server
+    if method in ('get', 'put', 'post'):
+        _, path, _ = line.decode().split(' ')
+        args = path.split('/')[1:]
+
+        hdr = dict()
+        while True:
+            line = (await reader.readline()).strip()
+            if not line:
+                break
+            k, v = line.decode().split(':', 1)
+            hdr[k.lower()] = v.strip()
+
+        body = b'\n'
+        if method in ('get') and 'key' == args[0]:
+            status, seq, body = await get_value(args[1])
+
+        elif method in ('put', 'post') and 'key' == args[0]:
+            key = args[1]
+            body = await reader.read(int(hdr['content-length']))
+
+            await LOCK.acquire()
+            try:
+                body, seq = await paxos_propose(key, body, 0)
+                body = body.encode()
+            finally:
+                LOCK.release()
+
+        writer.write('200 OK\nX_SEQ: {}\n'.format(seq).encode())
+        writer.write('CONTENT-LENGTH: {}\n\n'.format(len(body)).encode())
+        writer.write(body)
+        await writer.drain()
+        return writer.close()
+
+    # RPC Server
     cluster_ip_list = [s[0] for s in ARGS.servers]
     if writer.get_extra_info('peername')[0] not in cluster_ip_list:
         log('client%s not allowed', writer.get_extra_info('peername'))
         return writer.close()
 
-    req = json.loads(await reader.readline())
+    req = json.loads(line)
 
     value = req.pop('value', None)
     if value:
@@ -299,7 +338,7 @@ async def paxos_propose(key, value, version):
     # Get the best log_seq to be used
     responses = await rpc({s: dict(action='read_stats') for s in ARGS.servers})
     if len(responses) < quorum:
-        return 'NoInfoQuorum'
+        return 'NoInfoQuorum', 0
 
     seq = max([v['seq'] for v in responses.values()])
 
@@ -310,7 +349,7 @@ async def paxos_propose(key, value, version):
     responses = await rpc({s: dict(action='promise', seq=seq, promised=ts)
                            for s in responses})
     if len(responses) < quorum:
-        return 'NoPromiseQuorum'
+        return 'NoPromiseQuorum', 0
 
     # Find the best proposal that was already accepted in some previous round
     # We must discard our proposal and use that. KEY paxos step.
@@ -328,15 +367,15 @@ async def paxos_propose(key, value, version):
                                    version=proposal_kv[2])
                            for s in responses})
     if len(responses) < quorum:
-        return 'NoAcceptQuorum'
+        return 'NoAcceptQuorum', 0
 
     # Paxos - Learn Phase
     responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
                            for s in responses})
     if len(responses) < quorum:
-        return 'NoLearnQuorum'
+        return 'NoLearnQuorum', 0
 
-    return 'ok' if 0 == accepted else 'NotOurProposal'
+    return ('ok', seq) if 0 == accepted else ('NotOurProposal', 0)
 
 
 async def get_value(key):
@@ -346,7 +385,7 @@ async def get_value(key):
     responses = await rpc({s: dict(action='read_key', key=key)
                           for s in ARGS.servers})
     if len(responses) < quorum:
-        return 'NoQuorum'
+        return 'NoQuorum', 0, b''
 
     seq = max([v['seq'] for v in responses.values()])
     srv = [k for k, v in responses.items() if v['seq'] == seq]
@@ -355,11 +394,11 @@ async def get_value(key):
     for _, s in srv:
         responses = await rpc({s: dict(action='read_value', seq=seq)})
         for k, v in responses.items():
-            return v['value'].decode()
+            return 'ok', seq, v['value']
 
 
 async def timeout():
-    timeout = int(time.time()) % ARGS.timeout
+    timeout = int(time.time()) % min(ARGS.timeout, 3600)
     log('will exit after sec(%d)', timeout)
     await asyncio.sleep(timeout)
     log('exiting after sec(%d)', timeout)
@@ -399,7 +438,7 @@ if __name__ == '__main__':
     # Client - CLI
     if not ARGS.key:
         # This is only for testing - Pick random key and value
-        ARGS.key = str(int(time.time()*1000000))
+        ARGS.key = time.strftime('%y%m%d.%H%M%S.') + str(time.time()*10**6)
         ARGS.value = ARGS.key
 
     if ARGS.file or ARGS.value:
