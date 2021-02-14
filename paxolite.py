@@ -29,15 +29,15 @@ def db_init():
     return conn
 
 
-# Find out the log_seq for the next log entry to be filled.
+# Find out the log seq for the next log entry to be filled.
 # It is either the max seq in the db if it is not yet learned,
 # or the max seq+1 if the max entry is already learned.
 def get_next_seq():
-    row = DB.execute('''select seq, promised, accepted from log
+    row = DB.execute('''select seq, promised from log
                         order by seq desc limit 1''').fetchone()
 
     if row:
-        return row[0]+1 if row[1] is None and row[2] is None else row[0]
+        return row[0]+1 if row[1] is None else row[0]
 
     return 1
 
@@ -133,6 +133,21 @@ def paxos_accept(req):
         req['status'] = 'PromiseSeqMismatch'
         return req
 
+    # This implements optimistic locking. If the current seq for the key is not
+    # equal to version, terminate this request
+    if req['version'] > 0:
+        version = 0
+        rows = DB.execute('''select seq, promised, accepted from log
+                             where key=?
+                          ''', (req['key'],)).fetchall()
+        for seq, promised, accepted in rows:
+            if promised is None and accepted is None:
+                version = seq
+
+        if version != req['version']:
+            req['status'] = 'VersionMismatch'
+            return req
+
     # All good. Our promise seq is same as in the db.
     DB.execute('update log set accepted=?, key=?, value=? where seq=?',
                (req['promised'], req['key'], req.pop('value'), req['seq']))
@@ -164,6 +179,80 @@ def paxos_learn(req):
 
     req['status'] = 'ok'
     return req
+
+
+async def sync():
+    responses = await rpc({s: dict(action='read_stats') for s in ARGS.servers})
+
+    max_srv, max_seq = None, 0
+    for k, v in responses.items():
+        if v['seq'] > max_seq:
+            max_srv = k
+            max_seq = v['seq']
+
+    DB.rollback()
+
+    my_seq = get_next_seq()
+    if my_seq != max_seq:
+        DB.execute('delete from log where seq=?', (my_seq,))
+
+    # Update the servers that has fallen behind
+    for seq in range(my_seq, max_seq):
+        res = await _rpc(max_srv, dict(action='read_log', seq=seq))
+
+        if type(res) is not dict:
+            log('sync failed seq(%d) srv(%s)', seq, max_srv)
+            return
+
+        if 'NotFound' == res['status']:
+            continue
+
+        if 'ok' != res['status']:
+            log('sync failed seq(%d) srv(%s)', seq, max_srv)
+            return
+
+        DB.execute('delete from log where seq=?', (seq,))
+        DB.execute('delete from log where key=?', (res['key'],))
+        DB.execute('insert into log values(?,?,?,?,?)',
+                   (seq, None, None, res['key'], res['value']))
+        DB.commit()
+
+
+async def server(reader, writer):
+    cluster_ip_list = [s[0] for s in ARGS.servers]
+    if writer.get_extra_info('peername')[0] not in cluster_ip_list:
+        log('client%s not allowed', writer.get_extra_info('peername'))
+        return writer.close()
+
+    req = json.loads(await reader.readline())
+
+    value = req.pop('value', None)
+    if value:
+        req['value'] = await reader.read(value)
+
+    res = dict(
+        read_log=read_log,
+        read_key=read_key,
+        read_value=read_value,
+        read_stats=read_stats,
+        learn=paxos_learn,
+        accept=paxos_accept,
+        promise=paxos_promise,
+    )[req['action']](req)
+
+    value = res.pop('value', None)
+    if value:
+        res['value'] = len(value)
+
+    writer.write(json.dumps(res).encode())
+    writer.write(b'\n')
+    if value:
+        writer.write(value)
+
+    await writer.drain()
+    writer.close()
+
+    log('client%s rpc(%s)', writer.get_extra_info('peername'), res)
 
 
 async def _rpc(server, req):
@@ -204,7 +293,7 @@ async def rpc(server_req_map):
     return responses
 
 
-async def paxos_propose(key, value):
+async def paxos_propose(key, value, version):
     quorum = int(len(ARGS.servers)/2) + 1
 
     # Get the best log_seq to be used
@@ -226,16 +315,17 @@ async def paxos_propose(key, value):
     # Find the best proposal that was already accepted in some previous round
     # We must discard our proposal and use that. KEY paxos step.
     accepted = 0
-    proposal_kv = (key, value)
+    proposal_kv = (key, value, version)
     for res in responses.values():
         # This is the KEY step in paxos protocol
         if res['accepted'] > accepted:
             accepted = res['accepted']
-            proposal_kv = (res['key'], res['value'])
+            proposal_kv = (res['key'], res['value'], 0)
 
     # Paxos - Accept Phase
     responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
-                                   key=proposal_kv[0], value=proposal_kv[1])
+                                   key=proposal_kv[0], value=proposal_kv[1],
+                                   version=proposal_kv[2])
                            for s in responses})
     if len(responses) < quorum:
         return 'NoAcceptQuorum'
@@ -247,43 +337,6 @@ async def paxos_propose(key, value):
         return 'NoLearnQuorum'
 
     return 'ok' if 0 == accepted else 'NotOurProposal'
-
-
-async def server(reader, writer):
-    cluster_ip_list = [s[0] for s in ARGS.servers]
-    if writer.get_extra_info('peername')[0] not in cluster_ip_list:
-        log('client%s not allowed', writer.get_extra_info('peername'))
-        return writer.close()
-
-    req = json.loads(await reader.readline())
-
-    value = req.pop('value', None)
-    if value:
-        req['value'] = await reader.read(value)
-
-    res = dict(
-        read_log=read_log,
-        read_key=read_key,
-        read_value=read_value,
-        read_stats=read_stats,
-        learn=paxos_learn,
-        accept=paxos_accept,
-        promise=paxos_promise,
-    )[req['action']](req)
-
-    value = res.pop('value', None)
-    if value:
-        res['value'] = len(value)
-
-    writer.write(json.dumps(res).encode())
-    writer.write(b'\n')
-    if value:
-        writer.write(value)
-
-    await writer.drain()
-    writer.close()
-
-    log('client%s rpc(%s)', writer.get_extra_info('peername'), res)
 
 
 async def get_value(key):
@@ -305,52 +358,7 @@ async def get_value(key):
             return v['value'].decode()
 
 
-def client():
-    if ARGS.value or ARGS.file:
-        if ARGS.file:
-            with open(ARGS.file, 'rb') as fd:
-                value = fd.read()
-        else:
-            value = ARGS.value.encode()
-
-        return asyncio.get_event_loop().run_until_complete(
-            paxos_propose(ARGS.key, value))
-    else:
-        return asyncio.get_event_loop().run_until_complete(
-            get_value(ARGS.key))
-
-
 async def timeout():
-    responses = await rpc({s: dict(action='read_stats') for s in ARGS.servers})
-
-    max_srv, max_seq = None, 0
-    for k, v in responses.items():
-        if v['seq'] > max_seq:
-            max_srv = k
-            max_seq = v['seq']
-
-    DB.rollback()
-    # Update the servers that has fallen behind
-    for seq in range(get_next_seq(), max_seq):
-        res = await _rpc(max_srv, dict(action='read_log', seq=seq))
-
-        if type(res) is not dict:
-            log('sync failed seq(%d) srv(%s)', seq, max_srv)
-            return
-
-        if 'NotFound' == res['status']:
-            continue
-
-        if 'ok' != res['status']:
-            log('sync failed seq(%d) srv(%s)', seq, max_srv)
-            return
-
-        DB.execute('delete from log where seq=?', (seq,))
-        DB.execute('delete from log where key=?', (res['key'],))
-        DB.execute('insert into log values(?,?,?,?,?)',
-                   (seq, None, None, res['key'], res['value']))
-        DB.commit()
-
     timeout = int(time.time()) % ARGS.timeout
     log('will exit after sec(%d)', timeout)
     await asyncio.sleep(timeout)
@@ -361,25 +369,48 @@ if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
 
     ARGS = argparse.ArgumentParser()
-    ARGS.add_argument('--port', dest='port', type=int)
-    ARGS.add_argument('--timeout', dest='timeout', type=int, default=30)
-    ARGS.add_argument('--key', dest='key',
-                      default=time.strftime('%Y%m%d%H%M%S'))
-    ARGS.add_argument('--value', dest='value',
-                      default=str(int(time.time()*10000000)))
+
+    ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--file', dest='file')
+    ARGS.add_argument('--value', dest='value')
+    ARGS.add_argument('--version', dest='version', type=int, default=0)
+
+    ARGS.add_argument('--port', dest='port', type=int)
     ARGS.add_argument('--servers', dest='servers',
                       default='127.0.0.1:5000,127.0.0.1:5001,127.0.0.1:5002,'
                               '127.0.0.2:5003,127.0.0.1:5004')
+    ARGS.add_argument('--timeout', dest='timeout', type=int, default=30)
+
     ARGS = ARGS.parse_args()
 
     ARGS.servers = [(s.split(':')[0].strip(), int(s.split(':')[1]))
                     for s in ARGS.servers.split(',')]
+
+    # Start the server
     if ARGS.port:
         DB = db_init()
         asyncio.ensure_future(asyncio.start_server(server, '', ARGS.port))
         log('listening on port(%s)', ARGS.port)
+        asyncio.ensure_future(sync())
         asyncio.get_event_loop().run_until_complete(
                 asyncio.ensure_future(timeout()))
+        exit()
+
+    # Client - CLI
+    if not ARGS.key:
+        # This is only for testing - Pick random key and value
+        ARGS.key = str(int(time.time()*1000000))
+        ARGS.value = ARGS.key
+
+    if ARGS.file or ARGS.value:
+        if ARGS.file:
+            with open(ARGS.file, 'rb') as fd:
+                value = fd.read()
+        else:
+            value = ARGS.value.encode()
+
+        func = paxos_propose(ARGS.key, value, ARGS.version)
     else:
-        print(client())
+        func = get_value(ARGS.key)
+
+    print(asyncio.get_event_loop().run_until_complete(func))
