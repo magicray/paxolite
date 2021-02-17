@@ -1,7 +1,0 @@
-#!/bin/bash
-
-sqlite3 0/paxolite.db 'select * from log order by seq' | md5sum
-sqlite3 1/paxolite.db 'select * from log order by seq' | md5sum
-sqlite3 2/paxolite.db 'select * from log order by seq' | md5sum
-sqlite3 3/paxolite.db 'select * from log order by seq' | md5sum
-sqlite3 4/paxolite.db 'select * from log order by seq' | md5sum
