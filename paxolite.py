@@ -5,6 +5,8 @@ import asyncio
 import logging
 import hashlib
 import argparse
+import mimetypes
+import urllib.parse
 from logging import critical as log
 
 
@@ -110,7 +112,7 @@ def read_log(req):
     return response(req, 'ok', seq=0)
 
 
-async def get_value(key):
+async def get_value(key, existing_seq=0):
     quorum = int(len(ARGS.servers)/2) + 1
 
     # Get the best log_seq to be used
@@ -120,6 +122,9 @@ async def get_value(key):
         return 'NoQuorum', 0, b''
 
     seq = max([v['seq'] for v in responses.values()])
+    if existing_seq == seq:
+        return 'ok', seq, b''
+
     srv = [k for k, v in responses.items() if v['seq'] == seq]
     srv = sorted([(hashlib.md5(str(time.time()*10**9).encode()).digest(), s)
                  for s in srv])
@@ -256,8 +261,9 @@ async def server(reader, writer):
     method = line.decode().split(' ')[0].lower()
 
     # HTTP Server
-    if method in ('get', 'put', 'post'):
+    if 'get' == method:
         _, key, _ = line.decode().split(' ')
+        key = urllib.parse.unquote(key[1:])
 
         hdr = dict()
         while True:
@@ -267,18 +273,22 @@ async def server(reader, writer):
             k, v = line.decode().split(':', 1)
             hdr[k.lower()] = v.strip()
 
-        value = b'\n'
-        if 'get' == method:
-            status, seq, value = await get_value(key)
+        existing_seq = int(hdr.get('if-none-match', '"0"')[1:-1])
+        status, seq, value = await get_value(key, existing_seq)
 
-        elif method in ('put', 'post'):
-            value = await reader.read(int(hdr['content-length']))
-            x, seq = await paxos_propose(key, value, hdr.get('x_seq', 0))
-            value = x.encode()
+        if 0 == seq:
+            writer.write('HTTP/1.1 404 Not Found\n\n'.encode())
+        elif seq == existing_seq:
+            writer.write('HTTP/1.1 304 Not Modified\n'.encode())
+            writer.write('ETag: "{}"\n\n'.format(seq).encode())
+        else:
+            mime_type = mimetypes.guess_type(key)[0]
+            mime_type = mime_type if mime_type else 'text/plain'
+            writer.write('HTTP/1.1 200 OK\nETag: "{}"\n'.format(seq).encode())
+            writer.write('Content-Type: {}\n'.format(mime_type).encode())
+            writer.write('Content-Length: {}\n\n'.format(len(value)).encode())
+            writer.write(value)
 
-        writer.write('200 OK\nX_SEQ: {}\n'.format(seq).encode())
-        writer.write('CONTENT-LENGTH: {}\n\n'.format(len(value)).encode())
-        writer.write(value)
         await writer.drain()
         return writer.close()
 
