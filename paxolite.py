@@ -230,9 +230,7 @@ async def sync():
                 max_srv = k
                 max_seq = v['seq']
 
-        seq = get_next_seq()
-        if seq < max_seq:
-            to_be_deleted = seq
+        first_seq = seq = get_next_seq()
 
         # Update the servers that has fallen behind
         while seq < max_seq:
@@ -241,9 +239,8 @@ async def sync():
             if not res or 0 == res[max_srv]['seq']:
                 break
 
-            if to_be_deleted:
-                DB.execute('delete from log where seq=?', (to_be_deleted,))
-                to_be_deleted = None
+            if seq == first_seq:
+                DB.execute('delete from log where seq=?', (seq,))
 
             res = res[max_srv]
             DB.execute('delete from log where key=?', (res['key'],))
