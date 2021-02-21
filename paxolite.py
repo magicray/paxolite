@@ -58,26 +58,24 @@ async def rpc(server_req_map):
 # Cache frequently read key/value here. First read is from sqlite but
 # subsequent reads are going to be very fast, as we don't need to go to disk.
 class CACHE():
+    seq = 0
     key = dict()
     value = dict()
 
 
-# Find out the log seq for the next log entry to be filled.
-def get_next_seq():
-    row = DB.execute('''select seq, promised from log
-                        order by seq desc limit 1''').fetchone()
+STATS = dict()
 
-    # It is either the max seq in the db if it is not yet learned,
-    # or the max seq+1 if the max entry is already learned.
-    if row:
-        return row[0]+1 if row[1] is None else row[0]
 
-    # Nothing yet in the db, lets start our log with seq number 1
-    return 1
+def stats(metric):
+    if metric not in STATS:
+        STATS[metric] = 0
+
+    STATS[metric] += 1
 
 
 def read_stats(req):
-    return response(req, 'ok', seq=get_next_seq())
+    CACHE.seq += 1
+    return response(req, 'ok', seq=CACHE.seq, stats=STATS)
 
 
 def read_value(req):
@@ -98,18 +96,6 @@ def read_key(req):
         return response(req, 'ok', seq=CACHE.key[req['key']])
 
     return response(req, 'NotFound')
-
-
-def read_log(req):
-    DB.rollback()
-
-    row = DB.execute('select * from log where seq>=? order by seq limit 1',
-                     (req['seq'],)).fetchone()
-
-    if row and row[1] is None and row[2] is None:
-        return response(req, 'ok', seq=row[0], key=row[3], value=row[4])
-
-    return response(req, 'ok', seq=0)
 
 
 async def get_value(key, existing_seq=0):
@@ -137,10 +123,6 @@ async def get_value(key, existing_seq=0):
 def paxos_promise(req):
     DB.rollback()
 
-    # This log_seq would create a hole in the log. Terminate.
-    if req['seq'] != get_next_seq():
-        return response(req, 'InvalidSeq')
-
     # Insert a new row if it does not already exist for this log seq
     row = DB.execute('select * from log where seq=?', (req['seq'],)).fetchone()
     if not row:
@@ -150,9 +132,16 @@ def paxos_promise(req):
         row = DB.execute('select * from log where seq=?',
                          (req['seq'],)).fetchone()
 
-    # Our promise_seq is not bigger than the existing one. Terminate now.
+    # This row is already learned. Let this round proceed with learned value.
+    if row[1] is None:
+        stats('promise_fake')
+        return response(req, 'ok', key=row[3], value=row[4],
+                        accepted=req['promised'] - 1)
+
+    # Our promise_seq is not bigger than the existing one. Reject.
     if req['promised'] <= row[1]:
-        return response(req, 'SmallerPromiseSeq', existing=row[1])
+        stats('promise_reject')
+        return response(req, 'SeqMismatch')
 
     # Our promise seq is largest seen so far for this log seq.
     # Update promise seq and return current accepted values.
@@ -160,6 +149,7 @@ def paxos_promise(req):
     DB.execute('update log set promised=? where seq=?',
                (req['promised'], req['seq']))
     DB.commit()
+    stats('promise_ok')
 
     return response(req, 'ok', accepted=row[2], key=row[3], value=row[4])
 
@@ -170,9 +160,15 @@ def paxos_accept(req):
     row = DB.execute('select promised from log where seq=?',
                      (req['seq'],)).fetchone()
 
+    # This row is already learned
+    if row and row[0] is None:
+        stats('accept_fake')
+        return response(req, 'ok')
+
     # We did not participate in the promise phase. Reject.
     if not row or req['promised'] != row[0]:
-        return response(req, 'PromiseSeqMismatch')
+        stats('accept_reject')
+        return response(req, 'SeqMismatch')
 
     # Optimistic locking. Proceed only if the existing seq is same as specified
     # by client. Terminate otherwise.
@@ -193,6 +189,7 @@ def paxos_accept(req):
     DB.execute('update log set accepted=?, key=?, value=? where seq=?',
                (req['promised'], req['key'], req.pop('value'), req['seq']))
     DB.commit()
+    stats('accept_ok')
 
     return response(req, 'ok')
 
@@ -203,53 +200,114 @@ def paxos_learn(req):
     row = DB.execute('select promised, key from log where seq=?',
                      (req['seq'],)).fetchone()
 
+    # This row is already learned
+    if row and row[0] is None:
+        stats('learn_fake')
+        return response(req, 'ok')
+
     # We did not participate in promise/accept phase. Reject.
     if not row or req['promised'] != row[0]:
-        return response(req, 'PromiseSeqMismatch')
+        stats('learn_reject')
+        return response(req, 'SeqMismatch')
 
-    DB.execute('delete from log where seq<? and key=?', (req['seq'], row[1]))
     DB.execute('update log set promised=null, accepted=null where seq=?',
                (req['seq'],))
     DB.commit()
+    stats('learn_ok')
 
     CACHE.value.pop(CACHE.key.pop(row[1], 0), None)  # Clear the cache
 
     return response(req, 'ok')
 
 
+async def paxos_propose(key, value, version):
+    quorum = int(len(ARGS.servers)/2) + 1
+
+    if 'INVALID' == key:
+        seq = value
+        value = key.encode()
+        responses = {s: None for s in ARGS.servers}
+    else:
+        # Get the next seq to be used
+        responses = await rpc({s: dict(action='read_stats')
+                               for s in ARGS.servers})
+        if len(responses) < quorum:
+            return 'NoSeqQuorum', 0
+
+        seq = max([v['seq'] for v in responses.values()])
+
+    # We use current timestamp as the paxos seq number
+    ts = int(time.time()*10**6)
+
+    # Paxos - Promise Phase
+    responses = await rpc({s: dict(action='promise', seq=seq, promised=ts)
+                           for s in responses})
+    if len(responses) < quorum:
+        return 'NoPromiseQuorum', 0
+
+    # Find the best proposal that was already accepted in some previous round
+    # We must discard our proposal and use that. KEY paxos step.
+    accepted = 0
+    proposal_kv = (key, value, version)
+    for res in responses.values():
+        # This is the KEY step in paxos protocol
+        if res['accepted'] > accepted:
+            accepted = res['accepted']
+            proposal_kv = (res['key'], res['value'], 0)
+
+    # Paxos - Accept Phase
+    responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
+                                   key=proposal_kv[0], value=proposal_kv[1],
+                                   version=proposal_kv[2])
+                           for s in responses})
+    if len(responses) < quorum:
+        return 'NoAcceptQuorum', 0
+
+    # Paxos - Learn Phase
+    responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
+                           for s in responses})
+    if len(responses) < quorum:
+        return 'NoLearnQuorum', 0
+
+    return ('ok', seq) if 0 == accepted else ('ok', 0)
+
+
 async def sync():
     while True:
         DB.rollback()
 
-        responses = await rpc({s: dict(action='read_stats')
-                               for s in ARGS.servers})
+        stats('sync_loop')
+        seq = DB.execute('select value from log where seq=0').fetchone()[0]
+        max_seq = DB.execute('select max(seq) from log').fetchone()[0]
 
-        max_srv, max_seq = None, 0
-        for k, v in responses.items():
-            if v['seq'] > max_seq:
-                max_srv = k
-                max_seq = v['seq']
+        synced = max_seq
+        for seq in range(seq+1, max_seq+1):
+            row = DB.execute('select promised, key from log where seq=?',
+                             (seq,)).fetchone()
 
-        first_seq = seq = get_next_seq()
-
-        # Update the servers that has fallen behind
-        while seq < max_seq:
-            res = await rpc({max_srv: dict(action='read_log', seq=seq)})
-
-            if not res or 0 == res[max_srv]['seq']:
+            if row is None or row[0] is not None:
+                synced = seq - 1
                 break
 
-            if seq == first_seq:
-                DB.execute('delete from log where seq=?', (seq,))
+            DB.execute('delete from log where seq<? and key=?', (seq, row[1]))
 
-            res = res[max_srv]
-            DB.execute('delete from log where key=?', (res['key'],))
-            DB.execute('insert into log values(?,null,null,?,?)',
-                       (res['seq'], res['key'], res['value']))
-            DB.commit()
+        DB.execute('update log set value=? where seq=0', (synced,))
+        DB.commit()
+        stats('sync_commit')
 
-            seq = res['seq'] + 1
+        seq = DB.execute('select value from log where seq=0').fetchone()[0]
+        max_seq = DB.execute('select max(seq) from log').fetchone()[0]
 
+        for seq in range(seq+1, max_seq+1):
+            row = DB.execute('select promised from log where seq=?',
+                             (seq,)).fetchone()
+
+            stats('sync_check')
+            if row is None or row[0] is not None:
+                await paxos_propose('INVALID', seq, 0)
+                stats('sync_propose')
+
+        stats('sync_done')
         await asyncio.sleep(1)
 
 
@@ -302,7 +360,6 @@ async def server(reader, writer):
         req['value'] = await reader.read(value)
 
     res = dict(
-        read_log=read_log,
         read_key=read_key,
         read_value=read_value,
         read_stats=read_stats,
@@ -324,52 +381,6 @@ async def server(reader, writer):
     writer.close()
 
     log('client%s rpc(%s)', writer.get_extra_info('peername'), res)
-
-
-async def paxos_propose(key, value, version):
-    quorum = int(len(ARGS.servers)/2) + 1
-
-    # Get the next seq to be used
-    responses = await rpc({s: dict(action='read_stats') for s in ARGS.servers})
-    if len(responses) < quorum:
-        return 'NoSeqQuorum', 0
-
-    seq = max([v['seq'] for v in responses.values()])
-
-    # We use current timestamp as the paxos seq number
-    ts = int(time.time()*10**6)
-
-    # Paxos - Promise Phase
-    responses = await rpc({s: dict(action='promise', seq=seq, promised=ts)
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoPromiseQuorum', 0
-
-    # Find the best proposal that was already accepted in some previous round
-    # We must discard our proposal and use that. KEY paxos step.
-    accepted = 0
-    proposal_kv = (key, value, version)
-    for res in responses.values():
-        # This is the KEY step in paxos protocol
-        if res['accepted'] > accepted:
-            accepted = res['accepted']
-            proposal_kv = (res['key'], res['value'], 0)
-
-    # Paxos - Accept Phase
-    responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
-                                   key=proposal_kv[0], value=proposal_kv[1],
-                                   version=proposal_kv[2])
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoAcceptQuorum', 0
-
-    # Paxos - Learn Phase
-    responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoLearnQuorum', 0
-
-    return ('ok', seq) if 0 == accepted else ('NotOurProposal', 0)
 
 
 async def timeout():
@@ -410,6 +421,9 @@ if __name__ == '__main__':
             key      text,
             value    blob)''')
         DB.execute('create index if not exists log_key on log(key)')
+        DB.execute('insert or ignore into log values(0,null,null,null,0)')
+        DB.commit()
+        CACHE.seq = DB.execute('select max(seq) from log').fetchone()[0]
 
         asyncio.ensure_future(asyncio.start_server(server, '', ARGS.port))
         log('listening on port(%s)', ARGS.port)
