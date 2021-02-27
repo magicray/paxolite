@@ -123,20 +123,28 @@ async def get_value(key, existing_seq=0):
 def paxos_promise(req):
     DB.rollback()
 
-    # Insert a new row if it does not already exist for this log seq
     row = DB.execute('select * from log where seq=?', (req['seq'],)).fetchone()
+
+    # This is already learned. Pretend to still go ahead to help a new node
+    synced = DB.execute('select value from log where seq=0').fetchone()[0]
+    if req['seq'] <= synced:
+        key = Value = None
+
+        if row and row[1] is None:
+            key = row[3]
+            value = row[4]
+
+        stats('promise_fake')
+        return response(req, 'ok', key=key, value=value,
+                        accepted=req['promised']+1)
+
+    # Insert a new row if it does not already exist for this log seq
     if not row:
         # Make and entry in the log now
         DB.execute('insert into log(seq, promised, accepted) values(?,?,?)',
                    (req['seq'], 0, 0))
         row = DB.execute('select * from log where seq=?',
                          (req['seq'],)).fetchone()
-
-    # This row is already learned. Let this round proceed with learned value.
-    if row[1] is None:
-        stats('promise_fake')
-        return response(req, 'ok', key=row[3], value=row[4],
-                        accepted=req['promised'] - 1)
 
     # Our promise_seq is not bigger than the existing one. Reject.
     if req['promised'] <= row[1]:
@@ -157,18 +165,11 @@ def paxos_promise(req):
 def paxos_accept(req):
     DB.rollback()
 
-    row = DB.execute('select promised from log where seq=?',
-                     (req['seq'],)).fetchone()
-
-    # This row is already learned
-    if row and row[0] is None:
+    # This is already learned. Pretend to still go ahead to help a new node
+    synced = DB.execute('select value from log where seq=0').fetchone()[0]
+    if req['seq'] <= synced or (row and row[0] is None):
         stats('accept_fake')
         return response(req, 'ok')
-
-    # We did not participate in the promise phase. Reject.
-    if not row or req['promised'] != row[0]:
-        stats('accept_reject')
-        return response(req, 'SeqMismatch')
 
     # Optimistic locking. Proceed only if the existing seq is same as specified
     # by client. Terminate otherwise.
@@ -182,12 +183,29 @@ def paxos_accept(req):
         if version != req['version']:
             return response(req, 'VersionMismatch')
 
+    row = DB.execute('select promised from log where seq=?',
+                     (req['seq'],)).fetchone()
+
+    # Old paxos round still active. Reject.
+    if row and req['promised'] < row[0]:
+        stats('accept_reject')
+        return response(req, 'SeqMismatch')
+
     # All good. Accept this proposal. If a quorum reaches this step, this value
     # is learned. This seq -> (key,val) mapping is now permanent.
     # Proposer would detect that a quorum reached this stage and would in the
     # next learn phase, record this fact by setting promised/accepted as NULL.
-    DB.execute('update log set accepted=?, key=?, value=? where seq=?',
-               (req['promised'], req['key'], req.pop('value'), req['seq']))
+    if not row:
+        DB.execute('insert into log values(?,?,?,?,?',
+                   (req['seq'], req['promised'], req['promised'], req['key'],
+                    req.pop('value')))
+    else:
+        DB.execute('''update log
+                      set promised=?, accepted=?, key=?, value=?
+                      where seq=?
+                   ''', (req['promised'], req['promised'], req['key'],
+                         req.pop('value'), req['seq']))
+
     DB.commit()
     stats('accept_ok')
 
@@ -197,13 +215,14 @@ def paxos_accept(req):
 def paxos_learn(req):
     DB.rollback()
 
-    row = DB.execute('select promised, key from log where seq=?',
-                     (req['seq'],)).fetchone()
-
-    # This row is already learned
-    if row and row[0] is None:
+    # This is already learned. Pretend to still go ahead to help a new node
+    synced = DB.execute('select value from log where seq=0').fetchone()[0]
+    if req['seq'] <= synced or (row and row[0] is None):
         stats('learn_fake')
         return response(req, 'ok')
+
+    row = DB.execute('select promised, key from log where seq=?',
+                     (req['seq'],)).fetchone()
 
     # We did not participate in promise/accept phase. Reject.
     if not row or req['promised'] != row[0]:
