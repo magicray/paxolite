@@ -1,6 +1,6 @@
 import time
 import json
-import marshal
+import pickle
 import sqlite3
 import asyncio
 import logging
@@ -90,14 +90,13 @@ def read_kv(req):
 
     row = DB.execute('select * from kv where key=?', (req['key'],)).fetchone()
     if row:
-        return response(req, 'ok', version=row[1], checksum=row[2],
-                        value=row[3])
+        return response(req, 'ok', version=row[1], value=row[2])
 
     return response(req, 'ok', version=0)
 
 
 def check_kv_table(blob):
-    for key, version, value in marshal.loads(blob):
+    for key, version, value in pickle.loads(blob):
         if version:
             row = DB.execute('select version from kv where key=?',
                              (key,)).fetchone()
@@ -108,12 +107,10 @@ def check_kv_table(blob):
 
 
 def update_kv_table(seq, blob):
-    for key, version, value in marshal.loads(blob):
-        checksum = hashlib.sha256(value).hexdigest()
+    for key, version, value in pickle.loads(blob):
         DB.execute('delete from kv where key=?', (key,))
         if value:
-            DB.execute('insert into kv values(?,?,?,?)',
-                       (key, seq, checksum, value))
+            DB.execute('insert into kv values(?,?,?)', (key, seq, value))
 
     return True
 
@@ -169,7 +166,7 @@ def compute_checksum(seq, value):
                         (seq-1,)).fetchone()
     chksum = chksum[0] if chksum and chksum[0] else ''
 
-    checksum = hashlib.sha256()
+    checksum = hashlib.md5()
     checksum.update(chksum.encode())
     checksum.update(value)
     return checksum.hexdigest()
@@ -252,6 +249,8 @@ async def sync():
                 break
 
             checksum = compute_checksum(seq, res[max_srv]['value'])
+            assert(checksum == res[max_srv]['checksum'])
+
             DB.execute('delete from log where seq=? and promised is not null',
                        (seq,))
             DB.execute('insert into log values(?,null,null,?,?)',
@@ -371,15 +370,15 @@ class Client():
             responses = await rpc({srv: dict(action='read_kv', key=key)})
             for k, v in responses.items():
                 if 0 == v['version']:
-                    return 'notfound', 0, '', b''
+                    return 'notfound', 0, b''
 
                 if existing_version == v['version']:
-                    return 'ok', v['version'], v['checksum'], b''
+                    return 'ok', v['version'], b''
 
-                return 'ok', v['version'], v['checksum'], v['value']
+                return 'ok', v['version'], v['value']
 
     async def put(self, key_version_value_list):
-        return await paxos_propose(marshal.dumps(key_version_value_list))
+        return await paxos_propose(pickle.dumps(key_version_value_list))
 
     def sync(self, async_callable):
         return asyncio.get_event_loop().run_until_complete(async_callable)
@@ -412,7 +411,6 @@ if __name__ == '__main__':
         DB.execute('''create table if not exists kv(
             key      text primary key,
             version  unsigned integer,
-            checksum text,
             value    blob)''')
         DB.execute('''create table if not exists log(
             seq      unsigned integer primary key,
