@@ -1,5 +1,6 @@
 import time
 import json
+import marshal
 import sqlite3
 import asyncio
 import logging
@@ -55,13 +56,6 @@ async def rpc(server_req_map):
     return responses
 
 
-# Cache frequently read key/value here. First read is from sqlite but
-# subsequent reads are going to be very fast, as we don't need to go to disk.
-class CACHE():
-    key = dict()
-    value = dict()
-
-
 # Find out the log seq for the next log entry to be filled.
 def get_next_seq():
     row = DB.execute('''select seq, promised from log
@@ -80,175 +74,192 @@ def read_stats(req):
     return response(req, 'ok', seq=get_next_seq())
 
 
-def read_value(req):
-    return response(req, 'ok', value=CACHE.value[req['seq']])
-
-
-def read_key(req):
-    if req['key'] not in CACHE.key:
-        DB.rollback()
-
-        rows = DB.execute('select * from log where key=?', (req['key'],))
-
-        for row in filter(lambda row: row[1] is None, rows.fetchall()):
-            CACHE.key[req['key']] = row[0]
-            CACHE.value[row[0]] = row[4]
-
-    if req['key'] in CACHE.key:
-        return response(req, 'ok', seq=CACHE.key[req['key']])
-
-    return response(req, 'NotFound')
-
-
 def read_log(req):
     DB.rollback()
 
-    row = DB.execute('select * from log where seq>=? order by seq limit 1',
-                     (req['seq'],)).fetchone()
+    row = DB.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     if row and row[1] is None and row[2] is None:
-        return response(req, 'ok', seq=row[0], key=row[3], value=row[4])
+        return response(req, 'ok', checksum=row[3], value=row[4])
 
-    return response(req, 'ok', seq=0)
+    return response(req, 'ok')
 
 
-async def get_value(key, existing_seq=0):
-    quorum = int(len(ARGS.servers)/2) + 1
+def read_kv(req):
+    DB.rollback()
 
-    # Get the best log_seq to be used
-    responses = await rpc({s: dict(action='read_key', key=key)
-                          for s in ARGS.servers})
-    if len(responses) < quorum:
-        return 'NoQuorum', 0, b''
+    row = DB.execute('select * from kv where key=?', (req['key'],)).fetchone()
+    if row:
+        return response(req, 'ok', version=row[1], checksum=row[2],
+                        value=row[3])
 
-    seq = max([v['seq'] for v in responses.values()])
-    if existing_seq == seq:
-        return 'ok', seq, b''
+    return response(req, 'ok', version=0)
 
-    srv = [k for k, v in responses.items() if v['seq'] == seq]
-    srv = sorted([(hashlib.md5(str(time.time()*10**9).encode()).digest(), s)
-                 for s in srv])
-    for _, s in srv:
-        responses = await rpc({s: dict(action='read_value', seq=seq)})
-        for k, v in responses.items():
-            return 'ok', seq, v['value']
+
+def check_kv_table(blob):
+    for key, version, value in marshal.loads(blob):
+        if version:
+            row = DB.execute('select version from kv where key=?',
+                             (key,)).fetchone()
+            if row[0] != version:
+                return False
+
+    return True
+
+
+def update_kv_table(seq, blob):
+    for key, version, value in marshal.loads(blob):
+        checksum = hashlib.sha256(value).hexdigest()
+        DB.execute('delete from kv where key=?', (key,))
+        if value:
+            DB.execute('insert into kv values(?,?,?,?)',
+                       (key, seq, checksum, value))
+
+    return True
 
 
 def paxos_promise(req):
-    DB.rollback()
+    seq = get_next_seq()
 
-    # This log_seq would create a hole in the log. Terminate.
-    if req['seq'] != get_next_seq():
-        return response(req, 'InvalidSeq')
-
-    # Insert a new row if it does not already exist for this log seq
-    row = DB.execute('select * from log where seq=?', (req['seq'],)).fetchone()
+    # Insert a new row if it does not already exis
+    row = DB.execute('select * from log where seq=?', (seq,)).fetchone()
     if not row:
         # Make and entry in the log now
         DB.execute('insert into log(seq, promised, accepted) values(?,?,?)',
-                   (req['seq'], 0, 0))
-        row = DB.execute('select * from log where seq=?',
-                         (req['seq'],)).fetchone()
+                   (seq, 0, 0))
+        row = DB.execute('select * from log where seq=?', (seq,)).fetchone()
 
     # Our promise_seq is not bigger than the existing one. Terminate now.
     if req['promised'] <= row[1]:
-        return response(req, 'SmallerPromiseSeq', existing=row[1])
+        return response(req, 'InvalidSeq', seq=seq)
 
     # Our promise seq is largest seen so far for this log seq.
     # Update promise seq and return current accepted values.
     # This is the KEY step in paxos protocol.
-    DB.execute('update log set promised=? where seq=?',
-               (req['promised'], req['seq']))
+    DB.execute('update log set promised=? where seq=?', (req['promised'], seq))
     DB.commit()
 
-    return response(req, 'ok', accepted=row[2], key=row[3], value=row[4])
+    return response(req, 'ok', seq=seq, accepted=row[2], value=row[4])
 
 
 def paxos_accept(req):
-    DB.rollback()
-
     row = DB.execute('select promised from log where seq=?',
                      (req['seq'],)).fetchone()
 
     # We did not participate in the promise phase. Reject.
     if not row or req['promised'] != row[0]:
-        return response(req, 'PromiseSeqMismatch')
+        return response(req, 'InvalidPromise')
 
-    # Optimistic locking. Proceed only if the existing seq is same as specified
-    # by client. Terminate otherwise.
-    if req['version'] > 0:
-        rows = DB.execute('''select seq from log
-                             where key=? and promised is null
-                          ''', (req['key'],)).fetchall()
-
-        version = rows[0][0] if rows else 0
-
-        if version != req['version']:
-            return response(req, 'VersionMismatch')
+    if check_kv_table(req['value']) is not True:
+        return response(req, 'TxnConflict')
 
     # All good. Accept this proposal. If a quorum reaches this step, this value
-    # is learned. This seq -> (key,val) mapping is now permanent.
+    # is learned. This seq -> value mapping is now permanent.
     # Proposer would detect that a quorum reached this stage and would in the
     # next learn phase, record this fact by setting promised/accepted as NULL.
-    DB.execute('update log set accepted=?, key=?, value=? where seq=?',
-               (req['promised'], req['key'], req.pop('value'), req['seq']))
+    DB.execute('update log set accepted=?, value=? where seq=?',
+               (req['promised'], req.pop('value'), req['seq']))
     DB.commit()
 
     return response(req, 'ok')
+
+
+def compute_checksum(seq, value):
+    chksum = DB.execute('select checksum from log where seq=?',
+                        (seq-1,)).fetchone()
+    chksum = chksum[0] if chksum and chksum[0] else ''
+
+    checksum = hashlib.sha256()
+    checksum.update(chksum.encode())
+    checksum.update(value)
+    return checksum.hexdigest()
 
 
 def paxos_learn(req):
-    DB.rollback()
-
-    row = DB.execute('select promised, key from log where seq=?',
-                     (req['seq'],)).fetchone()
+    row = DB.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     # We did not participate in promise/accept phase. Reject.
-    if not row or req['promised'] != row[0]:
-        return response(req, 'PromiseSeqMismatch')
+    if not row or req['promised'] != row[1]:
+        return response(req, 'InvalidPromise')
 
-    DB.execute('delete from log where seq<? and key=?', (req['seq'], row[1]))
-    DB.execute('update log set promised=null, accepted=null where seq=?',
-               (req['seq'],))
+    checksum = compute_checksum(req['seq'], row[4])
+    DB.execute('''update log
+                  set promised=null, accepted=null, checksum=?
+                  where seq=?
+               ''', (checksum, req['seq']))
+    update_kv_table(req['seq'], row[4])
     DB.commit()
 
-    CACHE.value.pop(CACHE.key.pop(row[1], 0), None)  # Clear the cache
-
     return response(req, 'ok')
+
+
+async def paxos_propose(value):
+    quorum = int(len(ARGS.servers)/2) + 1
+
+    # We use current timestamp as the paxos seq number
+    ts = int(time.time()*10**6)
+
+    # Promise Phase
+    responses = await rpc({s: dict(action='promise', promised=ts)
+                           for s in ARGS.servers})
+    if len(responses) < quorum:
+        return 'NoPromiseQuorum', 0
+
+    seq = max([v['seq'] for v in responses.values()])
+
+    # Find the best proposal that was already accepted in some previous round
+    # We must discard our proposal and use that. KEY paxos step.
+    proposal = (0, value)
+    for res in responses.values():
+        # This is the KEY step in paxos protocol
+        if res['accepted'] > proposal[0] and res['seq'] == seq:
+            proposal = (res['accepted'], res['value'])
+
+    # Accept Phase
+    responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
+                                   value=proposal[1])
+                           for s in responses})
+    if len(responses) < quorum:
+        return 'NoAcceptQuorum', 0
+
+    # Learn Phase
+    responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
+                           for s in responses})
+    if len(responses) < quorum:
+        return 'NoLearnQuorum', 0
+
+    return ('ok', seq) if 0 == proposal[0] else ('ProposalConflict', 0)
 
 
 async def sync():
     while True:
-        DB.rollback()
-
         responses = await rpc({s: dict(action='read_stats')
                                for s in ARGS.servers})
 
         max_srv, max_seq = None, 0
         for k, v in responses.items():
             if v['seq'] > max_seq:
-                max_srv = k
-                max_seq = v['seq']
+                max_srv, max_seq = k, v['seq']
 
-        first_seq = seq = get_next_seq()
+        DB.rollback()
+        seq = get_next_seq()
 
         # Update the servers that has fallen behind
         while seq < max_seq:
             res = await rpc({max_srv: dict(action='read_log', seq=seq)})
 
-            if not res or 0 == res[max_srv]['seq']:
+            if not res or 'value' not in res[max_srv]:
                 break
 
-            if seq == first_seq:
-                DB.execute('delete from log where seq=?', (seq,))
-
-            res = res[max_srv]
-            DB.execute('delete from log where key=?', (res['key'],))
+            checksum = compute_checksum(seq, res[max_srv]['value'])
+            DB.execute('delete from log where seq=? and promised is not null',
+                       (seq,))
             DB.execute('insert into log values(?,null,null,?,?)',
-                       (res['seq'], res['key'], res['value']))
+                       (seq, checksum, res[max_srv]['value']))
+            update_kv_table(seq, res[max_srv]['value'])
             DB.commit()
 
-            seq = res['seq'] + 1
+            seq = get_next_seq()
 
         await asyncio.sleep(1)
 
@@ -270,18 +281,18 @@ async def server(reader, writer):
             k, v = line.decode().split(':', 1)
             hdr[k.lower()] = v.strip()
 
-        existing_seq = int(hdr.get('if-none-match', '"0"')[1:-1])
-        status, seq, value = await get_value(key, existing_seq)
+        version = int(hdr.get('if-none-match', '"0"')[1:-1])
+        status, ver, chksum, value = await Client().get(key, version)
 
-        if 0 == seq:
+        if status != 'ok':
             writer.write('HTTP/1.1 404 Not Found\n\n'.encode())
-        elif seq == existing_seq:
+        elif ver == version:
             writer.write('HTTP/1.1 304 Not Modified\n'.encode())
-            writer.write('ETag: "{}"\n\n'.format(seq).encode())
+            writer.write('ETag: "{}"\n\n'.format(ver).encode())
         else:
             mime_type = mimetypes.guess_type(key)[0]
             mime_type = mime_type if mime_type else 'text/plain'
-            writer.write('HTTP/1.1 200 OK\nETag: "{}"\n'.format(seq).encode())
+            writer.write('HTTP/1.1 200 OK\nETag: "{}"\n'.format(ver).encode())
             writer.write('Content-Type: {}\n'.format(mime_type).encode())
             writer.write('Content-Length: {}\n\n'.format(len(value)).encode())
             writer.write(value)
@@ -302,9 +313,8 @@ async def server(reader, writer):
         req['value'] = await reader.read(value)
 
     res = dict(
+        read_kv=read_kv,
         read_log=read_log,
-        read_key=read_key,
-        read_value=read_value,
         read_stats=read_stats,
         learn=paxos_learn,
         accept=paxos_accept,
@@ -326,57 +336,53 @@ async def server(reader, writer):
     log('client%s rpc(%s)', writer.get_extra_info('peername'), res)
 
 
-async def paxos_propose(key, value, version):
-    quorum = int(len(ARGS.servers)/2) + 1
-
-    # Get the next seq to be used
-    responses = await rpc({s: dict(action='read_stats') for s in ARGS.servers})
-    if len(responses) < quorum:
-        return 'NoSeqQuorum', 0
-
-    seq = max([v['seq'] for v in responses.values()])
-
-    # We use current timestamp as the paxos seq number
-    ts = int(time.time()*10**6)
-
-    # Paxos - Promise Phase
-    responses = await rpc({s: dict(action='promise', seq=seq, promised=ts)
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoPromiseQuorum', 0
-
-    # Find the best proposal that was already accepted in some previous round
-    # We must discard our proposal and use that. KEY paxos step.
-    accepted = 0
-    proposal_kv = (key, value, version)
-    for res in responses.values():
-        # This is the KEY step in paxos protocol
-        if res['accepted'] > accepted:
-            accepted = res['accepted']
-            proposal_kv = (res['key'], res['value'], 0)
-
-    # Paxos - Accept Phase
-    responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
-                                   key=proposal_kv[0], value=proposal_kv[1],
-                                   version=proposal_kv[2])
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoAcceptQuorum', 0
-
-    # Paxos - Learn Phase
-    responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoLearnQuorum', 0
-
-    return ('ok', seq) if 0 == accepted else ('NotOurProposal', 0)
-
-
 async def timeout():
     timeout = int(time.time()) % min(ARGS.timeout, 3600)
     log('will exit after sec(%d)', timeout)
     await asyncio.sleep(timeout)
+
+    row = DB.execute('select max(seq), min(seq), count(*) from log').fetchone()
+    if row:
+        new_min = row[1] + int((row[2] * timeout) / 86400)
+        DB.execute('delete from log where seq<?', (new_min,))
+        log('totol max(%d) min(%d) now(%d)', row[1], row[0], new_min)
+
     log('exiting after sec(%d)', timeout)
+
+
+class Client():
+    def __init__(self, servers=None):
+        self.servers = servers if servers else ARGS.servers
+
+    async def get(self, key, existing_version=0):
+        quorum = int(len(self.servers)/2) + 1
+
+        responses = await rpc({s: dict(action='read_stats')
+                               for s in self.servers})
+
+        if len(responses) < quorum:
+            return 'NoQuorum', 0, b''
+
+        seq = max([v['seq'] for v in responses.values()])
+        srvrs = [(hashlib.md5(str(time.time()*10**9).encode()).digest(), s)
+                 for s in [k for k, v in responses.items() if v['seq'] == seq]]
+
+        for _, srv in sorted(srvrs):
+            responses = await rpc({srv: dict(action='read_kv', key=key)})
+            for k, v in responses.items():
+                if 0 == v['version']:
+                    return 'notfound', 0, '', b''
+
+                if existing_version == v['version']:
+                    return 'ok', v['version'], v['checksum'], b''
+
+                return 'ok', v['version'], v['checksum'], v['value']
+
+    async def put(self, key_version_value_list):
+        return await paxos_propose(marshal.dumps(key_version_value_list))
+
+    def sync(self, async_callable):
+        return asyncio.get_event_loop().run_until_complete(async_callable)
 
 
 if __name__ == '__main__':
@@ -403,13 +409,17 @@ if __name__ == '__main__':
     # Start the server
     if ARGS.port:
         DB = sqlite3.connect('paxolite.db')
+        DB.execute('''create table if not exists kv(
+            key      text primary key,
+            version  unsigned integer,
+            checksum text,
+            value    blob)''')
         DB.execute('''create table if not exists log(
             seq      unsigned integer primary key,
             promised unsigned integer,
             accepted unsigned integer,
-            key      text,
+            checksum text,
             value    blob)''')
-        DB.execute('create index if not exists log_key on log(key)')
 
         asyncio.ensure_future(asyncio.start_server(server, '', ARGS.port))
         log('listening on port(%s)', ARGS.port)
@@ -424,6 +434,7 @@ if __name__ == '__main__':
         ARGS.key = time.strftime('%y%m%d.%H%M%S.') + str(time.time()*10**6)
         ARGS.value = ARGS.key
 
+    client = Client()
     if ARGS.file or ARGS.value:
         if ARGS.file:
             with open(ARGS.file, 'rb') as fd:
@@ -431,8 +442,6 @@ if __name__ == '__main__':
         else:
             value = ARGS.value.encode()
 
-        func = paxos_propose(ARGS.key, value, ARGS.version)
+        print(client.sync(client.put([(ARGS.key, ARGS.version, value)])))
     else:
-        func = get_value(ARGS.key)
-
-    print(asyncio.get_event_loop().run_until_complete(func))
+        print(client.sync(client.get(ARGS.key)))

@@ -1,17 +1,5 @@
 #!/bin/bash
 for i in 0 1 2 3 4; do
-    sqlite3 $i/paxolite.db 'select * from log order by seq desc' > dump.$i
-done
-
-for i in 0 1 2 3 4; do
-    cat dump.$i | md5sum
-done
-
-for i in 0 1 2 3 4; do
-    head -n 1 dump.$i
-done
-
-for i in 1 2 3 4; do
-    echo "---------- diff dump.0 dump.$i ------------"
-    diff dump.0 dump.$i
+    echo ------------- $i ----------------
+    sqlite3 $i/paxolite.db 'select * from log order by seq desc limit 2'
 done
