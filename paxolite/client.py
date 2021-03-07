@@ -33,50 +33,6 @@ async def rpc(server_req_map):
     return responses
 
 
-async def paxos_propose(servers, value):
-    quorum = int(len(servers)/2) + 1
-
-    # We use current timestamp as the paxos seq number
-    ts = int(time.time()/30) * 30
-
-    # Promise Phase
-    responses = await rpc({s: dict(action='promise', promised=ts)
-                           for s in servers})
-
-    if len(responses) < quorum:
-        return 'NoPromiseQuorum', 0
-
-    seq = max([v['seq'] for v in responses.values()])
-
-    responses = {k: v for k, v in responses.items() if v['seq'] == seq}
-
-    if len(responses) < quorum:
-        return 'NoPromiseQuorum', 0
-
-    # Find the best proposal that was already accepted in some previous round
-    # We must discard our proposal and use that. KEY paxos step.
-    proposal = (0, value)
-    for res in responses.values():
-        # This is the KEY step in paxos protocol
-        if res['accepted'] > proposal[0] and res['seq'] == seq:
-            proposal = (res['accepted'], res['value'])
-
-    # Accept Phase
-    responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
-                                   value=proposal[1])
-                           for s in responses})
-    if len(responses) < quorum:
-        return 'NoAcceptQuorum', 0
-
-    # Learn Phase
-    responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
-                           for s in servers})
-    if len(responses) < quorum:
-        return 'NoLearnQuorum', 0
-
-    return ('ok', seq) if 0 == proposal[0] else ('ProposalConflict', 0)
-
-
 class Client():
     def __init__(self, servers):
         self.servers = servers
@@ -106,14 +62,16 @@ class Client():
                 return 'ok', v['version'], v['value']
 
     async def put(self, key_version_value_list):
-        for i in range(50):
-            result = await paxos_propose(
-                self.servers, pickle.dumps(key_version_value_list))
+        for i in range(10):
+            for s in self.servers:
+                result = await rpc({s: dict(
+                    action='propose',
+                    value=pickle.dumps(key_version_value_list))})
 
-            if 'ok' == result[0]:
-                return result
+                if s in result and 'ok' == result[s]['status']:
+                    return result[s]
 
-            await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
     def sync(self, async_callable):
         return asyncio.get_event_loop().run_until_complete(async_callable)

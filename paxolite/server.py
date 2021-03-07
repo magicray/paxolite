@@ -1,10 +1,13 @@
 import os
+import time
 import pickle
 import socket
 import signal
 import sqlite3
 import logging
 import hashlib
+import asyncio
+from client import rpc
 from logging import critical as log
 
 logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
@@ -29,10 +32,6 @@ class Database():
             accepted unsigned integer,
             checksum text,
             value    blob)''')
-
-    def __del__(self):
-        self.conn.rollback()
-        self.conn.close()
 
 
 # Utility methods
@@ -182,20 +181,61 @@ def paxos_learn(req):
     return response(req, 'ok')
 
 
+async def paxos_propose(servers, value):
+    quorum = int(len(servers)/2) + 1
+
+    # We use current timestamp as the paxos seq number
+    ts = int(time.time()/30) * 30
+
+    # Promise Phase
+    responses = await rpc({s: dict(action='promise', promised=ts)
+                           for s in servers})
+
+    if len(responses) < quorum:
+        return dict(status='NoPromiseQuorum', seq=0)
+
+    seq = max([v['seq'] for v in responses.values()])
+
+    responses = {k: v for k, v in responses.items() if v['seq'] == seq}
+
+    if len(responses) < quorum:
+        return dict(status='NoPromiseQuorum', seq=0)
+
+    # Find the best proposal that was already accepted in some previous round
+    # We must discard our proposal and use that. KEY paxos step.
+    proposal = (0, value)
+    for res in responses.values():
+        # This is the KEY step in paxos protocol
+        if res['accepted'] > proposal[0] and res['seq'] == seq:
+            proposal = (res['accepted'], res['value'])
+
+    # Accept Phase
+    responses = await rpc({s: dict(action='accept', seq=seq, promised=ts,
+                                   value=proposal[1])
+                           for s in responses})
+    if len(responses) < quorum:
+        return dict(status='NoAcceptQuorum', seq=0)
+
+    # Learn Phase
+    responses = await rpc({s: dict(action='learn', seq=seq, promised=ts)
+                           for s in servers})
+    if len(responses) < quorum:
+        return dict(status='NoLearnQuorum', seq=0)
+
+    return dict(
+        status='ok' if 0 == proposal[0] else 'ProposalConflict',
+        seq=seq if 0 == proposal[0] else 0)
+
+
 def sync(peers):
+    db = Database()
+
+    # Update the servers that has fallen behind
     for peer in peers:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((peer[0], peer[1]))
-
-        sock.sendall(pickle.dumps(dict(action='read_stats')))
-        res = pickle.load(sock.makefile(mode='b'))
-        log('peer%s res(%s)', peer, res)
-
-        db = Database()
+        db.rollback()
         seq = get_next_seq(db)
 
-        # Update the servers that has fallen behind
-        for seq in range(seq, res['seq']):
+        while True:
             db.rollback()
 
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -203,6 +243,7 @@ def sync(peers):
 
             sock.sendall(pickle.dumps(dict(action='read_log', seq=seq)))
             res = pickle.load(sock.makefile(mode='b'))
+            sock.close()
 
             if 'value' not in res:
                 break
@@ -217,6 +258,8 @@ def sync(peers):
                        (seq, checksum, res['value']))
             update_kv_table(db, seq, res['value'])
             db.commit()
+
+            seq += 1
 
 
 def dict2str(src):
@@ -243,16 +286,19 @@ def server(port, peers):
             break
 
     req = pickle.load(conn.makefile(mode='rb'))
-    log('client%s req(%s)', addr, dict2str(req))
 
-    res = dict(
-        read_kv=read_kv,
-        read_log=read_log,
-        read_stats=read_stats,
-        learn=paxos_learn,
-        accept=paxos_accept,
-        promise=paxos_promise,
-    )[req['action']](req)
+    if 'propose' == req['action']:
+        res = asyncio.get_event_loop().run_until_complete(
+            paxos_propose(peers, req['value']))
+    else:
+        res = dict(
+            read_kv=read_kv,
+            read_log=read_log,
+            read_stats=read_stats,
+            learn=paxos_learn,
+            accept=paxos_accept,
+            promise=paxos_promise,
+        )[req['action']](req)
 
     conn.sendall(pickle.dumps(res))
     conn.close()
