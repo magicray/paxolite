@@ -13,25 +13,7 @@ from logging import critical as log
 logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
 
 
-class Database():
-    def __init__(self, name=None):
-        self.conn = sqlite3.connect(
-            'paxolite.{}.sqlite3'.format(name) if name else 'paxolite.sqlite3')
-
-        self.commit = self.conn.commit
-        self.execute = self.conn.execute
-        self.rollback = self.conn.rollback
-
-        self.execute('''create table if not exists kv(
-            key      text primary key,
-            version  unsigned integer,
-            value    blob)''')
-        self.execute('''create table if not exists log(
-            seq      unsigned integer primary key,
-            promised unsigned integer,
-            accepted unsigned integer,
-            checksum text,
-            value    blob)''')
+db = None
 
 
 # Utility methods
@@ -42,7 +24,7 @@ def response(x, status, **kwargs):
 
 
 # Find out the log seq for the next log entry to be filled.
-def get_next_seq(db):
+def get_next_seq():
     row = db.execute('''select seq, promised from log
                         order by seq desc limit 1''').fetchone()
 
@@ -56,12 +38,10 @@ def get_next_seq(db):
 
 
 def read_stats(req):
-    return response(req, 'ok', seq=get_next_seq(Database()))
+    return response(req, 'ok', seq=get_next_seq())
 
 
 def read_log(req):
-    db = Database()
-
     row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     if row and row[1] is None and row[2] is None:
@@ -71,8 +51,6 @@ def read_log(req):
 
 
 def read_kv(req):
-    db = Database()
-
     row = db.execute('select * from kv where key=?', (req['key'],)).fetchone()
     if row:
         return response(req, 'ok', version=row[1], value=row[2])
@@ -80,7 +58,7 @@ def read_kv(req):
     return response(req, 'ok', version=0)
 
 
-def check_kv_table(db, blob):
+def check_kv_table(blob):
     for key, version, value in pickle.loads(blob):
         if version:
             row = db.execute('select version from kv where key=?',
@@ -91,7 +69,7 @@ def check_kv_table(db, blob):
     return True
 
 
-def update_kv_table(db, seq, blob):
+def update_kv_table(seq, blob):
     for key, version, value in pickle.loads(blob):
         db.execute('delete from kv where key=?', (key,))
         if value:
@@ -101,11 +79,9 @@ def update_kv_table(db, seq, blob):
 
 
 def paxos_promise(req):
-    db = Database()
+    seq = get_next_seq()
 
-    seq = get_next_seq(db)
-
-    # Insert a new row if it does not already exis
+    # Insert a new row if it does not already exist
     row = db.execute('select * from log where seq=?', (seq,)).fetchone()
     if not row:
         # Make a new entry in the log
@@ -127,8 +103,6 @@ def paxos_promise(req):
 
 
 def paxos_accept(req):
-    db = Database()
-
     row = db.execute('select promised from log where seq=?',
                      (req['seq'],)).fetchone()
 
@@ -136,7 +110,7 @@ def paxos_accept(req):
     if not row or req['promised'] != row[0]:
         return response(req, 'InvalidPromise')
 
-    if check_kv_table(db, req['value']) is not True:
+    if check_kv_table(req['value']) is not True:
         return response(req, 'TxnConflict')
 
     # All good. Accept this proposal. If a quorum reaches this step, this value
@@ -150,7 +124,7 @@ def paxos_accept(req):
     return response(req, 'ok')
 
 
-def compute_checksum(db, seq, value):
+def compute_checksum(seq, value):
     chksum = db.execute('select checksum from log where seq=?',
                         (seq-1,)).fetchone()
     chksum = chksum[0] if chksum and chksum[0] else ''
@@ -162,20 +136,18 @@ def compute_checksum(db, seq, value):
 
 
 def paxos_learn(req):
-    db = Database()
-
     row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     # We did not participate in promise/accept phase. Reject.
-    if not row or req['promised'] != row[1]:
-        return response(req, 'InvalidPromise')
+    if not row or req['promised'] != row[1] or not row[4]:
+        return response(req, 'InvalidLearn')
 
-    checksum = compute_checksum(db, req['seq'], row[4])
+    checksum = compute_checksum(req['seq'], row[4])
     db.execute('''update log
                   set promised=null, accepted=null, checksum=?
                   where seq=?
                ''', (checksum, req['seq']))
-    update_kv_table(db, req['seq'], row[4])
+    update_kv_table(req['seq'], row[4])
     db.commit()
 
     return response(req, 'ok')
@@ -188,18 +160,20 @@ async def paxos_propose(servers, value):
     ts = int(time.time()/30) * 30
 
     # Promise Phase
-    responses = await rpc({s: dict(action='promise', promised=ts)
-                           for s in servers})
-
-    if len(responses) < quorum:
+    active = await rpc({s: dict(action='promise', promised=ts)
+                        for s in servers})
+    if len(active) < quorum:
         return dict(status='NoPromiseQuorum', seq=0)
 
-    seq = max([v['seq'] for v in responses.values()])
+    seq = max([v['seq'] for v in active.values()])
 
-    responses = {k: v for k, v in responses.items() if v['seq'] == seq}
+    responses = {k: v for k, v in active.items() if v['seq'] == seq}
 
     if len(responses) < quorum:
-        return dict(status='NoPromiseQuorum', seq=0)
+        await rpc({s: dict(action='sync')
+                   for s in set(active) - set(responses)})
+
+        return dict(status='SyncNeeded', seq=0)
 
     # Find the best proposal that was already accepted in some previous round
     # We must discard our proposal and use that. KEY paxos step.
@@ -227,13 +201,10 @@ async def paxos_propose(servers, value):
         seq=seq if 0 == proposal[0] else 0)
 
 
-def sync(peers):
-    db = Database()
-
-    # Update the servers that has fallen behind
+def sync(req, peers):
     for peer in peers:
         db.rollback()
-        seq = get_next_seq(db)
+        seq = get_next_seq()
 
         while True:
             db.rollback()
@@ -248,7 +219,7 @@ def sync(peers):
             if 'value' not in res:
                 break
 
-            checksum = compute_checksum(db, seq, res['value'])
+            checksum = compute_checksum(seq, res['value'])
             assert(checksum == res['checksum'])
 
             db.execute('''delete from log
@@ -256,10 +227,12 @@ def sync(peers):
                        ''', (seq,))
             db.execute('insert into log values(?,null,null,?,?)',
                        (seq, checksum, res['value']))
-            update_kv_table(db, seq, res['value'])
+            update_kv_table(seq, res['value'])
             db.commit()
 
             seq += 1
+
+    return response(req, 'ok', seq=get_next_seq())
 
 
 def dict2str(src):
@@ -287,23 +260,45 @@ def server(port, peers):
 
     req = pickle.load(conn.makefile(mode='rb'))
 
+    global db
+    db = ['paxolite', req.get('db', ''), 'sqlite3']
+    db = sqlite3.connect('.'.join([x for x in db if x]))
+
+    res = response(req, 'NotAllowed')
     if 'propose' == req['action']:
         res = asyncio.get_event_loop().run_until_complete(
             paxos_propose(peers, req['value']))
-    else:
+
+    elif 'sync' == req['action']:
+        res = sync(req, peers)
+
+    elif req['action'] in ('promise', 'accept', 'learn'):
+        if addr[0] in [ip for ip, port in peers]:
+            db.execute('''create table if not exists kv(
+                key      text primary key,
+                version  unsigned integer,
+                value    blob)''')
+            db.execute('''create table if not exists log(
+                seq      unsigned integer primary key,
+                promised unsigned integer,
+                accepted unsigned integer,
+                checksum text,
+                value    blob)''')
+
+            res = dict(
+                learn=paxos_learn,
+                accept=paxos_accept,
+                promise=paxos_promise,
+            )[req['action']](req)
+
+    elif req['action'] in ('read_kv', 'read_log', 'read_stats'):
         res = dict(
             read_kv=read_kv,
             read_log=read_log,
             read_stats=read_stats,
-            learn=paxos_learn,
-            accept=paxos_accept,
-            promise=paxos_promise,
         )[req['action']](req)
 
     conn.sendall(pickle.dumps(res))
     conn.close()
 
     log('client%s res(%s)', addr, dict2str(res))
-
-    if 'learn' == req['action'] and 'ok' != res['status']:
-        sync(peers)
