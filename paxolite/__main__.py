@@ -6,6 +6,7 @@ import argparse
 
 ARGS = argparse.ArgumentParser()
 
+ARGS.add_argument('--db', dest='db', default='default')
 ARGS.add_argument('--key', dest='key')
 ARGS.add_argument('--file', dest='file')
 ARGS.add_argument('--value', dest='value')
@@ -28,8 +29,8 @@ if ARGS.port:
 # Client - CLI
 if not ARGS.key:
     # This is only for testing - Pick random key and value
-    ARGS.key = time.strftime('%y%m%d.%H%M%S.') + str(time.time()*10**6)
-    ARGS.value = ARGS.key
+    ARGS.key = time.strftime('%H%M')
+    ARGS.value = str(time.time()*10**6)
 
 cli = client.Client(ARGS.servers)
 if ARGS.file or ARGS.value:
@@ -39,6 +40,6 @@ if ARGS.file or ARGS.value:
     else:
         value = ARGS.value.encode()
 
-    print(cli.sync(cli.put([(ARGS.key, ARGS.version, value)])))
+    print(cli.sync(cli.put(ARGS.db, [(ARGS.key, ARGS.version, value)])))
 else:
-    print(cli.sync(cli.get(ARGS.key)))
+    print(cli.sync(cli.get(ARGS.db, ARGS.key)))

@@ -37,10 +37,10 @@ class Client():
     def __init__(self, servers):
         self.servers = servers
 
-    async def get(self, key, existing_version=0):
+    async def get(self, db, key, existing_version=0):
         quorum = int(len(self.servers)/2) + 1
 
-        responses = await rpc({s: dict(action='read_stats')
+        responses = await rpc({s: dict(action='read_stats', db=db)
                                for s in self.servers})
 
         if len(responses) < quorum:
@@ -51,7 +51,8 @@ class Client():
                  for s in [k for k, v in responses.items() if v['seq'] == seq]]
 
         for _, srv in sorted(srvrs):
-            responses = await rpc({srv: dict(action='read_kv', key=key)})
+            responses = await rpc({srv: dict(action='read_kv',
+                                             db=db, key=key)})
             for k, v in responses.items():
                 if 0 == v['version']:
                     return 'notfound', 0, b''
@@ -61,17 +62,21 @@ class Client():
 
                 return 'ok', v['version'], v['value']
 
-    async def put(self, key_version_value_list):
-        for i in range(10):
-            for s in self.servers:
-                result = await rpc({s: dict(
-                    action='propose',
-                    value=pickle.dumps(key_version_value_list))})
+    async def put(self, db, key_version_value_list):
+        value = pickle.dumps(key_version_value_list)
 
-                if s in result and 'ok' == result[s]['status']:
-                    return result[s]
+        for s in self.servers:
+            try:
+                result = await _rpc(s, dict(action='propose',
+                                            db=db, value=value))
 
-                await asyncio.sleep(1)
+                if 'ok' == result['status']:
+                    result.pop('__server__')
+                    return result
+
+                await asyncio.sleep(10 + time.time() % 10)
+            except Exception:
+                continue
 
     def sync(self, async_callable):
         return asyncio.get_event_loop().run_until_complete(async_callable)
