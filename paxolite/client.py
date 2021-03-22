@@ -16,9 +16,9 @@ async def _rpc(server, req):
 
     tmp = res.copy()
     tmp.pop('value', None)
-    log('server%s rpc(%s)', server, tmp)
+    log('server%s %s', server, tmp)
 
-    res['__server__'] = server
+    res['server'] = server
     return res
 
 
@@ -28,7 +28,7 @@ async def rpc(server_req_map):
     responses = dict()
     for res in await asyncio.gather(*tasks, return_exceptions=True):
         if type(res) is dict and 'ok' == res['status']:
-            responses[res.pop('__server__')] = res
+            responses[res['server']] = res
 
     return responses
 
@@ -46,37 +46,39 @@ class Client():
         if len(responses) < quorum:
             return 'NoQuorum', 0, b''
 
+        # From the most updated servers, we want to pick in the random order
         seq = max([v['seq'] for v in responses.values()])
         srvrs = [(hashlib.md5(str(time.time()*10**9).encode()).digest(), s)
                  for s in [k for k, v in responses.items() if v['seq'] == seq]]
 
-        for _, srv in sorted(srvrs):
-            responses = await rpc({srv: dict(action='read_kv',
-                                             db=db, key=key)})
-            for k, v in responses.items():
-                if 0 == v['version']:
-                    return 'notfound', 0, b''
+        # Some servers are out of sync. Tell them about it.
+        await rpc({s: dict(action='sync', db=db)
+                   for s in set(self.servers)-set([s for _, s in srvrs])})
 
-                if existing_version == v['version']:
-                    return 'ok', v['version'], b''
+        # Fetch data from the most updated servers
+        # Servers are picked in random order for load balancing
+        for _, s in sorted(srvrs):
+            res = await rpc({s: dict(action='read_kv', db=db, key=key)})
+            res = res[s]
 
-                return 'ok', v['version'], v['value']
+            if 0 == res['version']:
+                return 'notfound', 0, b''
+
+            if existing_version == res['version']:
+                return 'ok', res['version'], b''
+
+            return 'ok', res['version'], res['value']
 
     async def put(self, db, key_version_value_list):
         value = pickle.dumps(key_version_value_list)
 
         for s in self.servers:
             try:
-                result = await _rpc(s, dict(action='propose',
-                                            db=db, value=value))
+                r = await _rpc(s, dict(action='propose', db=db, value=value))
 
-                if 'ok' == result['status']:
-                    result.pop('__server__')
-                    return result
+                if 'ok' == r['status']:
+                    return r
 
                 await asyncio.sleep(10 + time.time() % 10)
             except Exception:
                 continue
-
-    def sync(self, async_callable):
-        return asyncio.get_event_loop().run_until_complete(async_callable)

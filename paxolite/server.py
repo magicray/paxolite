@@ -10,17 +10,8 @@ import asyncio
 from client import rpc
 from logging import critical as log
 
-logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
-
 
 db = None
-
-
-# Utility methods
-def response(x, status, **kwargs):
-    x.update(kwargs)
-    x['status'] = status
-    return x
 
 
 # Find out the log seq for the next log entry to be filled.
@@ -38,42 +29,24 @@ def get_next_seq():
 
 
 def read_stats(req):
-    return response(req, 'ok', seq=get_next_seq())
+    return dict(status='ok', seq=get_next_seq())
 
 
 def read_log(req):
     row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     if row and row[1] is None and row[2] is None:
-        return response(req, 'ok', checksum=row[3], value=row[4])
+        return dict(status='ok', checksum=row[3], value=row[4])
 
-    return response(req, 'ok')
+    return dict(status='ok')
 
 
 def read_kv(req):
     row = db.execute('select * from kv where key=?', (req['key'],)).fetchone()
     if row:
-        return response(req, 'ok', version=row[1], value=row[2])
+        return dict(status='ok', version=row[1], value=row[2])
 
-    return response(req, 'ok', version=0)
-
-
-def check_kv_table(blob):
-    for key, version, value in pickle.loads(blob):
-        if version:
-            row = db.execute('select version from kv where key=?',
-                             (key,)).fetchone()
-            if row[0] != version:
-                return False
-
-    return True
-
-
-def update_kv_table(seq, blob):
-    for key, version, value in pickle.loads(blob):
-        db.execute('delete from kv where key=?', (key,))
-        if value:
-            db.execute('insert into kv values(?,?,?)', (key, seq, value))
+    return dict(status='ok', version=0)
 
 
 def paxos_promise(req):
@@ -90,7 +63,7 @@ def paxos_promise(req):
 
     # Our promise_seq is not bigger than the existing one. Terminate now.
     if req['promised'] <= row[1]:
-        return response(req, 'InvalidSeq', seq=seq)
+        return dict(status='InvalidSeq', seq=seq)
 
     # Our promise seq is largest seen so far for this log seq.
     # Update promise seq and return current accepted values.
@@ -100,7 +73,7 @@ def paxos_promise(req):
     db.execute('delete from log where seq=0')
     db.commit()
 
-    return response(req, 'ok', seq=seq, accepted=row[2], value=row[4])
+    return dict(status='ok', seq=seq, accepted=row[2], value=row[4])
 
 
 def paxos_accept(req):
@@ -111,10 +84,15 @@ def paxos_accept(req):
 
     # We did not participate in the promise phase. Reject.
     if not row or req['promised'] != row[0]:
-        return response(req, 'InvalidPromise')
+        return dict(status='InvalidPromise')
 
-    if check_kv_table(req['value']) is not True:
-        return response(req, 'TxnConflict')
+    # Optimistic lock check. Ensure no one already updated the key
+    for key, version, value in pickle.loads(req['value']):
+        if version:
+            row = db.execute('select version from kv where key=?',
+                             (key,)).fetchone()
+            if row[0] != version:
+                return dict(status='TxnConflict')
 
     # All good. Accept this proposal. If a quorum reaches this step, this value
     # is learned. This seq -> value mapping is now permanent.
@@ -126,7 +104,7 @@ def paxos_accept(req):
     db.execute('delete from log where seq=0')
     db.commit()
 
-    return response(req, 'ok')
+    return dict(status='ok')
 
 
 def compute_checksum(seq, value):
@@ -140,6 +118,13 @@ def compute_checksum(seq, value):
     return checksum.hexdigest()
 
 
+def update_kv_table(seq, blob):
+    for key, version, value in pickle.loads(blob):
+        db.execute('delete from kv where key=?', (key,))
+        if value:
+            db.execute('insert into kv values(?,?,?)', (key, seq, value))
+
+
 def paxos_learn(req):
     db.execute('insert into log values(0,null,null,null,null)')
 
@@ -147,7 +132,7 @@ def paxos_learn(req):
 
     # We did not participate in promise/accept phase. Reject.
     if not row or req['promised'] != row[1]:
-        return response(req, 'InvalidLearn')
+        return dict(status='InvalidLearn')
 
     checksum = compute_checksum(req['seq'], row[4])
     db.execute('''update log
@@ -159,7 +144,7 @@ def paxos_learn(req):
     db.execute('delete from log where seq=0')
     db.commit()
 
-    return response(req, 'ok')
+    return dict(status='ok')
 
 
 async def paxos_propose(db, servers, value):
@@ -214,13 +199,13 @@ async def paxos_propose(db, servers, value):
 
 
 async def sync(db_name, peers):
+    db.execute('insert into log values(0,null,null,null,null)')
+
     responses = await rpc({s: dict(action='read_stats', db=db_name)
                            for s in peers})
 
     seq = max([v['seq'] for k, v in responses.items()])
     peer = [k for k, v in responses.items() if v['seq'] == seq][0]
-
-    db.execute('insert into log values(0,null,null,null,null)')
 
     seq = get_next_seq()
     while True:
@@ -251,13 +236,8 @@ async def sync(db_name, peers):
     db.commit()
 
 
-def dict2str(src):
-    dst = src.copy()
-    dst.pop('value', None)
-    return dst
-
-
 def server(port, peers):
+    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -280,13 +260,10 @@ def server(port, peers):
     global db
     db = sqlite3.connect('paxolite.' + req['db'] + '.sqlite3')
 
-    res = response(req, 'NotAllowed')
     if 'propose' == req['action']:
         res = asyncio.get_event_loop().run_until_complete(
             paxos_propose(req['db'], peers, req['value']))
-
-    elif 'sync' == req['action']:
-        res = response(req, 'ok')
+        req.pop('value')
 
     elif req['action'] in ('promise', 'accept', 'learn'):
         if addr[0] in [ip for ip, port in peers]:
@@ -314,10 +291,18 @@ def server(port, peers):
             read_stats=read_stats,
         )[req['action']](req)
 
-    conn.sendall(pickle.dumps(res))
+    elif 'sync' == req['action']:
+        res = dict(status='ok')
+
+    else:
+        res = dict(status='NotAllowed')
+
+    req.update(res)
+    conn.sendall(pickle.dumps(req))
     conn.close()
 
-    log('client%s res(%s)', addr, dict2str(res))
+    req.pop('value', None)
+    log('client%s %s', addr, req)
 
     if 'sync' == req['action']:
         asyncio.get_event_loop().run_until_complete(sync(req['db'], peers))
