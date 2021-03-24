@@ -11,9 +11,6 @@ import argparse
 from logging import critical as log
 
 
-db = None
-
-
 async def _rpc(server, req):
     reader, writer = await asyncio.open_connection(server[0], server[1])
 
@@ -43,24 +40,21 @@ async def rpc(server_req_map):
 
 
 # Find out the log seq for the next log entry to be filled.
-def get_next_seq():
-    row = db.execute('''select seq, promised from log
-                        order by seq desc limit 1''').fetchone()
+def read_next_seq(req, db):
+    # If db is empty, start with seq number 1
+    seq = 1
 
     # It is either the max seq in the db if it is not yet learned,
     # or the max seq+1 if the max entry is already learned.
+    row = db.execute('''select seq, promised from log
+                        order by seq desc limit 1''').fetchone()
     if row:
-        return row[0]+1 if row[1] is None else row[0]
+        seq = row[0]+1 if row[1] is None else row[0]
 
-    # Nothing yet in the db, lets start our log with seq number 1
-    return 1
-
-
-def read_stats(req):
-    return dict(status='ok', seq=get_next_seq())
+    return dict(status='ok', seq=seq)
 
 
-def read_log(req):
+def read_log(req, db):
     row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     if row and row[1] is None and row[2] is None:
@@ -69,7 +63,7 @@ def read_log(req):
     return dict(status='ok')
 
 
-def read_kv(req):
+def read_kv(req, db):
     row = db.execute('select * from kv where key=?', (req['key'],)).fetchone()
     if row:
         return dict(status='ok', version=row[1], value=row[2])
@@ -77,9 +71,9 @@ def read_kv(req):
     return dict(status='ok', version=0)
 
 
-def paxos_promise(req):
+def paxos_promise(req, db):
     db.execute('insert into log values(0,null,null,null,null)')
-    seq = get_next_seq()
+    seq = read_next_seq(req, db)['seq']
 
     # Insert a new row if it does not already exist
     row = db.execute('select * from log where seq=?', (seq,)).fetchone()
@@ -105,7 +99,7 @@ def paxos_promise(req):
     return dict(status='ok', seq=seq, accepted=row[2], value=row[4])
 
 
-def paxos_accept(req):
+def paxos_accept(req, db):
     db.execute('insert into log values(0,null,null,null,null)')
 
     row = db.execute('select promised from log where seq=?',
@@ -136,7 +130,7 @@ def paxos_accept(req):
     return dict(status='ok')
 
 
-def compute_checksum(seq, value):
+def compute_checksum(seq, value, db):
     chksum = db.execute('select checksum from log where seq=?',
                         (seq-1,)).fetchone()
     chksum = chksum[0] if chksum and chksum[0] else ''
@@ -147,14 +141,14 @@ def compute_checksum(seq, value):
     return checksum.hexdigest()
 
 
-def update_kv_table(seq, blob):
+def update_kv_table(seq, blob, db):
     for key, version, value in pickle.loads(blob):
         db.execute('delete from kv where key=?', (key,))
         if value:
             db.execute('insert into kv values(?,?,?)', (key, seq, value))
 
 
-def paxos_learn(req):
+def paxos_learn(req, db):
     db.execute('insert into log values(0,null,null,null,null)')
 
     row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
@@ -163,12 +157,12 @@ def paxos_learn(req):
     if not row or req['promised'] != row[1]:
         return dict(status='InvalidLearn')
 
-    checksum = compute_checksum(req['seq'], row[4])
+    checksum = compute_checksum(req['seq'], row[4], db)
     db.execute('''update log
                   set promised=null, accepted=null, checksum=?
                   where seq=?
                ''', (checksum, req['seq']))
-    update_kv_table(req['seq'], row[4])
+    update_kv_table(req['seq'], row[4], db)
 
     db.execute('delete from log where seq=0')
     db.commit()
@@ -176,14 +170,14 @@ def paxos_learn(req):
     return dict(status='ok')
 
 
-async def paxos_propose(db, value):
+async def paxos_propose(req):
     quorum = int(len(ARGS.servers)/2) + 1
 
     # We use current timestamp as the paxos seq number
     ts = int(time.time())
 
     # Promise Phase
-    responses = await rpc({s: dict(action='promise', db=db, promised=ts)
+    responses = await rpc({s: dict(action='promise', db=req['db'], promised=ts)
                            for s in ARGS.servers})
     if len(responses) < quorum:
         return dict(status='NoPromiseQuorum', seq=0)
@@ -193,31 +187,32 @@ async def paxos_propose(db, value):
     responses = {k: v for k, v in responses.items() if v['seq'] == seq}
 
     if len(responses) < quorum:
-        await rpc({s: dict(action='sync', db=db)
+        await rpc({s: dict(action='sync', db=req['db'])
                    for s in set(ARGS.servers)-set(responses)})
 
         return dict(status='SyncNeeded', seq=0)
 
     # Find the best proposal that was already accepted in some previous round
     # We must discard our proposal and use that. KEY paxos step.
-    proposal = (0, value)
+    proposal = (0, req['value'])
     for res in responses.values():
         # This is the KEY step in paxos protocol
         if res['accepted'] > proposal[0] and res['seq'] == seq:
             proposal = (res['accepted'], res['value'])
 
     # Accept Phase
-    responses = await rpc({s: dict(action='accept', db=db, seq=seq,
+    responses = await rpc({s: dict(action='accept', db=req['db'], seq=seq,
                                    promised=ts, value=proposal[1])
                            for s in responses})
     if len(responses) < quorum:
         return dict(status='NoAcceptQuorum', seq=0)
 
     # Learn Phase
-    responses = await rpc({s: dict(action='learn', db=db, seq=seq, promised=ts)
+    responses = await rpc({s: dict(action='learn', db=req['db'],
+                                   seq=seq, promised=ts)
                            for s in responses})
     if len(responses) < quorum:
-        await rpc({s: dict(action='sync', db=db)
+        await rpc({s: dict(action='sync', db=req['db'])
                    for s in set(ARGS.servers)-set(responses)})
 
         return dict(status='NoLearnQuorum', seq=0)
@@ -227,29 +222,29 @@ async def paxos_propose(db, value):
         seq=seq if 0 == proposal[0] else 0)
 
 
-async def sync(db_name):
+async def sync(req, db):
     db.execute('insert into log values(0,null,null,null,null)')
 
-    responses = await rpc({s: dict(action='read_stats', db=db_name)
+    responses = await rpc({s: dict(action='read_next_seq', db=req['db'])
                            for s in ARGS.servers})
 
     seq = max([v['seq'] for k, v in responses.items()])
     peer = [k for k, v in responses.items() if v['seq'] == seq][0]
 
-    seq = get_next_seq()
+    seq = read_next_seq(req, db)['seq']
     while True:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((peer[0], peer[1]))
 
         sock.sendall(pickle.dumps(dict(action='read_log',
-                                       db=db_name, seq=seq)))
+                                       db=req['db'], seq=seq)))
         res = pickle.load(sock.makefile(mode='b'))
         sock.close()
 
         if 'value' not in res:
             break
 
-        checksum = compute_checksum(seq, res['value'])
+        checksum = compute_checksum(seq, res['value'], db)
         assert(checksum == res['checksum'])
 
         db.execute('''delete from log
@@ -257,7 +252,7 @@ async def sync(db_name):
                    ''', (seq,))
         db.execute('insert into log values(?,null,null,?,?)',
                    (seq, checksum, res['value']))
-        update_kv_table(seq, res['value'])
+        update_kv_table(seq, res['value'], db)
 
         seq += 1
 
@@ -286,12 +281,10 @@ def server():
 
     req = pickle.load(conn.makefile(mode='rb'))
 
-    global db
     db = sqlite3.connect('paxolite.' + req['db'] + '.sqlite3')
 
     if 'propose' == req['action']:
-        res = asyncio.get_event_loop().run_until_complete(
-            paxos_propose(req['db'], req['value']))
+        res = call_sync(paxos_propose(req))
         req.pop('value')
 
     elif req['action'] in ('promise', 'accept', 'learn'):
@@ -311,14 +304,14 @@ def server():
                 learn=paxos_learn,
                 accept=paxos_accept,
                 promise=paxos_promise,
-            )[req['action']](req)
+            )[req['action']](req, db)
 
-    elif req['action'] in ('read_kv', 'read_log', 'read_stats'):
+    elif req['action'] in ('read_kv', 'read_log', 'read_next_seq'):
         res = dict(
             read_kv=read_kv,
             read_log=read_log,
-            read_stats=read_stats,
-        )[req['action']](req)
+            read_next_seq=read_next_seq,
+        )[req['action']](req, db)
 
     elif 'sync' == req['action']:
         res = dict(status='ok')
@@ -334,58 +327,59 @@ def server():
     log('client%s %s', addr, req)
 
     if 'sync' == req['action']:
-        asyncio.get_event_loop().run_until_complete(sync(req['db']))
+        call_sync(sync(req, db))
 
 
-class Client():
-    def __init__(self, servers):
-        self.servers = servers
+async def get(servers, db, key, existing_version=0):
+    quorum = int(len(servers)/2) + 1
 
-    async def get(self, db, key, existing_version=0):
-        quorum = int(len(self.servers)/2) + 1
+    responses = await rpc({s: dict(action='read_next_seq', db=db)
+                           for s in servers})
 
-        responses = await rpc({s: dict(action='read_stats', db=db)
-                               for s in self.servers})
+    if len(responses) < quorum:
+        return 'NoQuorum', 0, b''
 
-        if len(responses) < quorum:
-            return 'NoQuorum', 0, b''
+    # From the most updated servers, we want to pick in the random order
+    seq = max([v['seq'] for v in responses.values()])
+    srvrs = [(hashlib.md5(str(time.time()*10**9).encode()).digest(), s)
+             for s in [k for k, v in responses.items() if v['seq'] == seq]]
 
-        # From the most updated servers, we want to pick in the random order
-        seq = max([v['seq'] for v in responses.values()])
-        srvrs = [(hashlib.md5(str(time.time()*10**9).encode()).digest(), s)
-                 for s in [k for k, v in responses.items() if v['seq'] == seq]]
+    # Some servers are out of sync. Tell them about it.
+    await rpc({s: dict(action='sync', db=db)
+               for s in set(servers)-set([s for _, s in srvrs])})
 
-        # Some servers are out of sync. Tell them about it.
-        await rpc({s: dict(action='sync', db=db)
-                   for s in set(self.servers)-set([s for _, s in srvrs])})
+    # Fetch data from the most updated servers
+    # Servers are picked in random order for load balancing
+    for _, s in sorted(srvrs):
+        res = await rpc({s: dict(action='read_kv', db=db, key=key)})
+        res = res[s]
 
-        # Fetch data from the most updated servers
-        # Servers are picked in random order for load balancing
-        for _, s in sorted(srvrs):
-            res = await rpc({s: dict(action='read_kv', db=db, key=key)})
-            res = res[s]
+        if 0 == res['version']:
+            return 'notfound', 0, b''
 
-            if 0 == res['version']:
-                return 'notfound', 0, b''
+        if existing_version == res['version']:
+            return 'ok', res['version'], b''
 
-            if existing_version == res['version']:
-                return 'ok', res['version'], b''
+        return 'ok', res['version'], res['value']
 
-            return 'ok', res['version'], res['value']
 
-    async def put(self, db, key_version_value_list):
-        value = pickle.dumps(key_version_value_list)
+async def put(servers, db, key_version_value_list):
+    value = pickle.dumps(key_version_value_list)
 
-        for s in self.servers:
-            try:
-                r = await _rpc(s, dict(action='propose', db=db, value=value))
+    for s in servers:
+        try:
+            r = await _rpc(s, dict(action='propose', db=db, value=value))
 
-                if 'ok' == r['status']:
-                    return r
+            if 'ok' == r['status']:
+                return r
 
-                await asyncio.sleep(10 + time.time() % 10)
-            except Exception:
-                continue
+            await asyncio.sleep(10 + time.time() % 10)
+        except Exception:
+            continue
+
+
+def call_sync(obj):
+    return asyncio.get_event_loop().run_until_complete(obj)
 
 
 if __name__ == '__main__':
@@ -413,10 +407,8 @@ if __name__ == '__main__':
             ARGS.key = time.strftime('%H%M')
             ARGS.value = str(time.time()*10**9) * 10**4
 
-        cli = Client(ARGS.servers)
-        print(asyncio.get_event_loop().run_until_complete(
-            cli.put(ARGS.db, [(ARGS.key, ARGS.version, ARGS.value.encode())])))
+        print(call_sync(put(
+            ARGS.servers, ARGS.db,
+            [(ARGS.key, ARGS.version, ARGS.value.encode())])))
     else:
-        cli = Client(ARGS.servers)
-        print(asyncio.get_event_loop().run_until_complete(
-            cli.get(ARGS.db, ARGS.key)))
+        print(call_sync(get(ARGS.servers, ARGS.db, ARGS.key)))
