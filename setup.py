@@ -4,7 +4,7 @@ from distutils.core import setup
 
 setup(version=time.strftime('%y%m%d.%H%M%S'),
       name='paxolite',
-      package=['paxolite'],
+      module=['paxolite'],
       description='Replicated Key Value store, '
                   'using Paxos for replication and SQLite for storage',
       author='Bhupendra Singh',

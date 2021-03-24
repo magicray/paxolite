@@ -1,5 +1,5 @@
 #!/bin/bash
 for i in 0 1 2 3 4; do
     echo ------------- $i ----------------
-    sqlite3 $i/paxolite.sqlite3 'select * from log order by seq desc limit 2'
+    sqlite3 $i/paxolite.default.sqlite3 'select seq, promised, accepted, checksum from log order by seq desc limit 2'
 done

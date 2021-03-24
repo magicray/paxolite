@@ -70,6 +70,7 @@ def paxos_promise(req):
     # This is the KEY step in paxos protocol.
     db.execute('update log set promised=? where seq=?', (req['promised'], seq))
 
+    db.execute('delete from log where seq < ?', (seq-10000,))
     db.execute('delete from log where seq=0')
     db.commit()
 
