@@ -1,5 +1,6 @@
 import os
 import time
+import fcntl
 import pickle
 import socket
 import signal
@@ -131,14 +132,15 @@ def paxos_accept(req, db):
 
 
 def compute_checksum(seq, value, db):
-    chksum = db.execute('select checksum from log where seq=?',
-                        (seq-1,)).fetchone()
-    chksum = chksum[0] if chksum and chksum[0] else ''
+    row = db.execute('select checksum from log where seq=?',
+                     (seq-1,)).fetchone()
+    old_checksum = row[0] if row and row[0] else ''
 
-    checksum = hashlib.md5()
-    checksum.update(chksum.encode())
-    checksum.update(value)
-    return checksum.hexdigest()
+    new_checksum = hashlib.md5()
+    new_checksum.update(old_checksum.encode())
+    new_checksum.update(value)
+
+    return new_checksum.hexdigest()
 
 
 def update_kv_table(seq, blob, db):
@@ -261,7 +263,7 @@ async def sync(req, db):
 
 
 def server():
-    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
+    # This would avoid creation of any zombie processes
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -274,17 +276,24 @@ def server():
         conn, addr = sock.accept()
 
         if os.fork():
+            # Parent process. Continue waiting for next client connection
+            # Closing as this connection would be handled by the child process
             conn.close()
         else:
+            # Child process. Close the listening socket
             sock.close()
             break
 
+    # This is forked child process. We will serve just one request here.
     req = pickle.load(conn.makefile(mode='rb'))
 
     db = sqlite3.connect('paxolite.' + req['db'] + '.sqlite3')
 
     if 'propose' == req['action']:
+        fd = os.open('paxolite.propose.lock', os.O_CREAT | os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
         res = call_sync(paxos_propose(req))
+        fcntl.flock(fd, fcntl.LOCK_UN)
         req.pop('value')
 
     elif req['action'] in ('promise', 'accept', 'learn'):
@@ -366,14 +375,11 @@ async def get(servers, db, key, existing_version=0):
 async def put(servers, db, key_version_value_list):
     value = pickle.dumps(key_version_value_list)
 
-    for s in servers:
+    srvrs = [(hashlib.md5((db + str(s)).encode()).hexdigest(), s)
+             for s in servers]
+    for _, s in sorted(srvrs):
         try:
-            r = await _rpc(s, dict(action='propose', db=db, value=value))
-
-            if 'ok' == r['status']:
-                return r
-
-            await asyncio.sleep(10 + time.time() % 10)
+            return await _rpc(s, dict(action='propose', db=db, value=value))
         except Exception:
             continue
 
@@ -383,6 +389,7 @@ def call_sync(obj):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
     ARGS = argparse.ArgumentParser()
 
     ARGS.add_argument('--db', dest='db', default='default')
@@ -405,7 +412,7 @@ if __name__ == '__main__':
         if not ARGS.key:
             # This is only for testing - Pick random key and value
             ARGS.key = time.strftime('%H%M')
-            ARGS.value = str(time.time()*10**9) * 10**4
+            ARGS.value = str(time.time()*10**9) * 4*10**4
 
         print(call_sync(put(
             ARGS.servers, ARGS.db,
