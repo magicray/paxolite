@@ -34,10 +34,14 @@ async def rpc(server_req_map):
 
     responses = dict()
     for res in await asyncio.gather(*tasks, return_exceptions=True):
-        if type(res) is dict and 'ok' == res['status']:
+        if type(res) is dict:
             responses[res['server']] = res
 
     return responses
+
+
+def status_filter(status, responses):
+    return {k: v for k, v in responses.items() if v['status'] == status}
 
 
 # Find out the log seq for the next log entry to be filled.
@@ -181,6 +185,8 @@ async def paxos_propose(req):
     # Promise Phase
     responses = await rpc({s: dict(action='promise', db=req['db'], promised=ts)
                            for s in ARGS.servers})
+    responses = status_filter('ok', responses)
+
     if len(responses) < quorum:
         return dict(status='NoPromiseQuorum', seq=0)
 
@@ -206,6 +212,11 @@ async def paxos_propose(req):
     responses = await rpc({s: dict(action='accept', db=req['db'], seq=seq,
                                    promised=ts, value=proposal[1])
                            for s in responses})
+
+    if len(status_filter('TxnConflict', responses)) > 0:
+        return dict(status='TxnConflict', seq=0)
+
+    responses = status_filter('ok', responses)
     if len(responses) < quorum:
         return dict(status='NoAcceptQuorum', seq=0)
 
@@ -213,6 +224,7 @@ async def paxos_propose(req):
     responses = await rpc({s: dict(action='learn', db=req['db'],
                                    seq=seq, promised=ts)
                            for s in responses})
+    responses = status_filter('ok', responses)
     if len(responses) < quorum:
         await rpc({s: dict(action='sync', db=req['db'])
                    for s in set(ARGS.servers)-set(responses)})
@@ -344,7 +356,6 @@ async def get(servers, db, key, existing_version=0):
 
     responses = await rpc({s: dict(action='read_next_seq', db=db)
                            for s in servers})
-
     if len(responses) < quorum:
         return 'NoQuorum', 0, b''
 
