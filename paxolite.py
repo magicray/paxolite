@@ -9,12 +9,15 @@ import logging
 import hashlib
 import asyncio
 import argparse
+import mimetypes
+import urllib.parse
 from logging import critical as log
 
 
 async def _rpc(server, req):
     reader, writer = await asyncio.open_connection(server[0], server[1])
 
+    writer.write(b'\n')
     writer.write(pickle.dumps(req))
     await writer.drain()
 
@@ -226,10 +229,10 @@ async def paxos_propose(req):
                            for s in responses})
     responses = status_filter('ok', responses)
     if len(responses) < quorum:
-        await rpc({s: dict(action='sync', db=req['db'])
-                   for s in set(ARGS.servers)-set(responses)})
-
         return dict(status='NoLearnQuorum', seq=0)
+
+    await rpc({s: dict(action='sync', db=req['db'])
+               for s in set(ARGS.servers)-set(responses)})
 
     return dict(
         status='ok' if 0 == proposal[0] else 'ProposalConflict',
@@ -247,13 +250,17 @@ async def sync(req, db):
 
     seq = read_next_seq(req, db)['seq']
     while True:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((peer[0], peer[1]))
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((peer[0], peer[1]))
 
-        sock.sendall(pickle.dumps(dict(action='read_log',
-                                       db=req['db'], seq=seq)))
-        res = pickle.load(sock.makefile(mode='b'))
-        sock.close()
+            sock.sendall(b'\n')
+            sock.sendall(pickle.dumps(dict(action='read_log',
+                                           db=req['db'], seq=seq)))
+            res = pickle.load(sock.makefile(mode='b'))
+            sock.close()
+        except Exception:
+            break
 
         if 'value' not in res:
             break
@@ -267,12 +274,14 @@ async def sync(req, db):
         db.execute('insert into log values(?,null,null,?,?)',
                    (seq, checksum, res['value']))
         update_kv_table(seq, res['value'], db)
+        db.execute('''delete from log
+                      where seq<? and promised is null
+                   ''', (seq,))
 
         seq += 1
 
     db.execute('delete from log where seq=0')
     db.commit()
-
 
 def server():
     # This would avoid creation of any zombie processes
@@ -297,8 +306,43 @@ def server():
             break
 
     # This is forked child process. We will serve just one request here.
-    req = pickle.load(conn.makefile(mode='rb'))
 
+    fd = conn.makefile(mode='rb')
+    line = fd.readline().decode().strip()
+
+    # HTTP Server
+    if line:
+        _, url, _ = line.split(' ')
+        db, key = urllib.parse.unquote(url.strip('/')).split('/')
+
+        hdr = dict()
+        while True:
+            line = fd.readline().strip()
+            if not line:
+                break
+            k, v = line.decode().split(':', 1)
+            hdr[k.lower()] = v.strip()
+
+        version = int(hdr.get('if-none-match', '"0"')[1:-1])
+        status, ver, value = call_sync(get(ARGS.servers, db, key, version))
+
+        if status != 'ok':
+            conn.sendall('HTTP/1.1 404 Not Found\n\n'.encode())
+        elif ver == version:
+            conn.sendall('HTTP/1.1 304 Not Modified\n'.encode())
+            conn.sendall('ETag: "{}"\n\n'.format(ver).encode())
+        else:
+            mime_type = mimetypes.guess_type(key)[0]
+            mime_type = mime_type if mime_type else 'text/plain'
+            conn.sendall('HTTP/1.1 200 OK\nETag: "{}"\n'.format(ver).encode())
+            conn.sendall('Content-Type: {}\n'.format(mime_type).encode())
+            conn.sendall('Content-Length: {}\n\n'.format(len(value)).encode())
+            conn.sendall(value)
+
+        return conn.close()
+
+    # RPC Server
+    req = pickle.load(fd)
     db = sqlite3.connect('paxolite.' + req['db'] + '.sqlite3')
 
     if 'propose' == req['action']:
