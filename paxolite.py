@@ -1,5 +1,6 @@
 import os
 import time
+import fcntl
 import pickle
 import socket
 import signal
@@ -79,7 +80,7 @@ def read_key_state(req, db):
 
 
 def paxos_promise(req, db):
-    db.execute('insert into log(seq) values(0)')
+    db.execute('update log set key=0 where seq=0')
 
     row = db.execute('''select seq, promised, accepted from log
                         order by seq desc limit 1
@@ -104,7 +105,7 @@ def paxos_promise(req, db):
     # This is the KEY step in paxos protocol.
     db.execute('update log set promised=? where seq=?', (req['promised'], seq))
 
-    db.execute('delete from log where seq=0')
+    db.execute('update log set key=null where seq=0')
     db.commit()
 
     return dict(status='ok', seq=seq, accepted=row[2],
@@ -112,7 +113,7 @@ def paxos_promise(req, db):
 
 
 def paxos_accept(req, db):
-    db.execute('insert into log(seq) values(0)')
+    db.execute('update log set key=0 where seq=0')
 
     row = db.execute('select promised from log where seq=?',
                      (req['seq'],)).fetchone()
@@ -128,7 +129,7 @@ def paxos_accept(req, db):
                             order by seq desc limit 1
                          ''', (req['key'],)).fetchone()
         if row and row[0] != req['version']:
-            return dict(status='Locked')
+            return dict(status='Conflict', seq=row[0])
 
     # All good. Accept this proposal. If a quorum reaches this step, this value
     # is learned. This seq -> value mapping is now permanent.
@@ -139,14 +140,14 @@ def paxos_accept(req, db):
                ''', (req['promised'], req['promised'],
                      req['key'], req.pop('value'), req['seq']))
 
-    db.execute('delete from log where seq=0')
+    db.execute('update log set key=null where seq=0')
     db.commit()
 
     return dict(status='ok')
 
 
 def paxos_learn(req, db):
-    db.execute('insert into log(seq) values(0)')
+    db.execute('update log set key=0 where seq=0')
 
     if 'value' in req:
         db.execute('delete from log where seq=?', (req['seq'],))
@@ -156,7 +157,7 @@ def paxos_learn(req, db):
         db.execute('update log set promised=null, accepted=null where seq=?',
                    (req['seq'],))
 
-    db.execute('delete from log where seq=0')
+    db.execute('update log set key=null where seq=0')
     db.commit()
 
     return dict(status='ok')
@@ -190,7 +191,7 @@ async def paxos_propose(req):
     proposal = (0, req['key'], req['value'])
     for res in responses.values():
         # This is the KEY step in paxos protocol
-        if res['accepted'] > proposal[0]:
+        if res['accepted'] and res['accepted'] > proposal[0]:
             proposal = (res['accepted'], res['key'], res['value'])
 
     # Accept Phase
@@ -200,6 +201,11 @@ async def paxos_propose(req):
                                    key=proposal[1], value=proposal[2],
                                    version=version)
                            for s in ARGS.servers})
+
+    # Check if we were not lucky enough to get Optimistic Lock
+    for k, v in status_filter('Conflict', responses).items():
+        return dict(status='Conflict', seq=v['seq'])
+
     responses = status_filter('ok', responses)
 
     if len(responses) < quorum:
@@ -284,19 +290,13 @@ def server():
     db = sqlite3.connect('paxolite.' + req['db'] + '.sqlite3')
 
     if 'propose' == req['action']:
+        fcntl.flock(os.open('paxolite.propose.lock', os.O_CREAT | os.O_RDONLY),
+                    fcntl.LOCK_EX)
         res = call_sync(paxos_propose(req))
         req.pop('value')
 
     elif req['action'] in ('promise', 'accept', 'learn'):
         if addr[0] in [ip for ip, port in ARGS.servers]:
-            db.execute('''create table if not exists log(
-                seq      integer primary key autoincrement,
-                promised integer,
-                accepted integer,
-                key      text,
-                value    blob)''')
-            db.execute('create index if not exists i1 on log(key, seq)')
-
             res = dict(
                 learn=paxos_learn,
                 accept=paxos_accept,
@@ -322,7 +322,8 @@ def server():
 
 
 async def put(servers, db, key, version, value):
-    srvrs = [(hashlib.md5(db.encode()).hexdigest(), s) for s in servers]
+    srvrs = [(hashlib.md5((db + str(s)).encode()).digest(), s)
+             for s in servers]
 
     for _, s in sorted(srvrs):
         try:
@@ -353,7 +354,7 @@ async def sync(servers, db, seq=1):
 
                     seq += 1
                     ok = True
-                    print((seq, srvrs))
+                    print((time.strftime('%H:%M:%S'), seq, srvrs))
                     break
         except Exception:
             pass
@@ -391,12 +392,29 @@ def call_sync(obj):
     return asyncio.get_event_loop().run_until_complete(obj)
 
 
+def init(db, passwd):
+    db = sqlite3.connect('paxolite.' + db + '.sqlite3')
+
+    db.execute('''create table if not exists log(
+        seq      integer primary key autoincrement,
+        promised integer,
+        accepted integer,
+        key      text,
+        value    blob)''')
+    db.execute('create index if not exists i1 on log(key, seq)')
+    db.execute('insert into log(seq, value) values(0,?)',
+               (passwd,))
+    db.commit()
+
+
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
     ARGS = argparse.ArgumentParser()
 
     ARGS.add_argument('--db', dest='db', default='default')
+    ARGS.add_argument('--passwd', dest='passwd')
     ARGS.add_argument('--sync', dest='sync', type=int)
+
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
     ARGS.add_argument('--version', dest='version', type=int, default=0)
@@ -412,6 +430,8 @@ if __name__ == '__main__':
 
     if ARGS.port:
         server()
+    elif ARGS.passwd:
+        init(ARGS.db, ARGS.passwd)
     elif ARGS.sync:
         call_sync(sync(ARGS.servers, ARGS.db, ARGS.sync))
     elif not ARGS.key or ARGS.value:
@@ -423,4 +443,4 @@ if __name__ == '__main__':
         print(call_sync(put(ARGS.servers, ARGS.db,
                             ARGS.key, ARGS.version, ARGS.value.encode())))
     else:
-        print(call_sync(get(ARGS.servers, ARGS.db, ARGS.key)))
+        print(call_sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
