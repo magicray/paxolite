@@ -321,14 +321,22 @@ def server():
     log('client%s %s', addr, req)
 
 
-async def put(servers, db, key, version, value):
+async def put(servers, db, value, key=None, version=0):
     srvrs = [(hashlib.md5((db + str(s)).encode()).digest(), s)
              for s in servers]
 
+    if key is None:
+        key = hashlib.sha256(value).hexdigest()
+
     for _, s in sorted(srvrs):
         try:
-            return await _rpc(s, dict(action='propose', db=db,
-                                      key=key, version=version, value=value))
+            res = await _rpc(s, dict(action='propose', db=db,
+                                     key=key, version=version, value=value))
+
+            if 'ok' != res['status']:
+                return dict(status=res['status'])
+
+            return dict(status=res['status'], version=res['seq'])
         except Exception:
             continue
 
@@ -354,13 +362,14 @@ async def sync(servers, db, seq=1):
 
                     seq += 1
                     ok = True
-                    print((time.strftime('%H:%M:%S'), seq, srvrs))
+                    print((time.strftime('%H:%M:%S'), r['key'], seq,
+                           len(r['value']), srvrs))
                     break
         except Exception:
             pass
 
         if not ok:
-            time.sleep(1)
+            time.sleep(5)
 
 
 async def get(servers, db, key, existing_version=0):
@@ -368,10 +377,14 @@ async def get(servers, db, key, existing_version=0):
 
     responses = await rpc({s: dict(action='read_key_state', db=db, key=key)
                            for s in servers})
+
+    if len(status_filter('NotFound', responses)) >= quorum:
+        return dict(status='NotFound')
+
     responses = status_filter('ok', responses)
 
     if len(responses) < quorum:
-        return 'NoQuorum', 0, b''
+        return dict(status='NoQuorum')
 
     best = None
     for k, v in responses.items():
@@ -385,7 +398,7 @@ async def get(servers, db, key, existing_version=0):
     else:
         res = dict(value=None)
 
-    return 'ok', seq, res['value']
+    return dict(status='ok', version=seq, value=res['value'])
 
 
 def call_sync(obj):
@@ -436,11 +449,10 @@ if __name__ == '__main__':
         call_sync(sync(ARGS.servers, ARGS.db, ARGS.sync))
     elif not ARGS.key or ARGS.value:
         if not ARGS.key:
-            # This is only for testing - Pick random key and value
-            ARGS.key = time.strftime('%H%M')
-            ARGS.value = str(time.time()*10**6)  # * 4*10**4
+            # This is only for testing - Pick a random value
+            ARGS.value = str(time.time()*10**6)
 
         print(call_sync(put(ARGS.servers, ARGS.db,
-                            ARGS.key, ARGS.version, ARGS.value.encode())))
+                            ARGS.value.encode(), ARGS.key, ARGS.version)))
     else:
         print(call_sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
