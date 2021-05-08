@@ -14,7 +14,7 @@ import urllib.parse
 from logging import critical as log
 
 
-async def _rpc(server, req):
+async def rpc(server, req):
     reader, writer = await asyncio.open_connection(server[0], server[1])
 
     writer.write(b'\n')
@@ -32,8 +32,8 @@ async def _rpc(server, req):
     return res
 
 
-async def rpc(server_req_map):
-    tasks = [_rpc(k, v) for k, v in server_req_map.items()]
+async def mrpc(server_req_map):
+    tasks = [rpc(k, v) for k, v in server_req_map.items()]
 
     responses = dict()
     for res in await asyncio.gather(*tasks, return_exceptions=True):
@@ -43,7 +43,7 @@ async def rpc(server_req_map):
     return responses
 
 
-def status_filter(status, responses):
+def rpc_filter(status, responses):
     return {k: v for k, v in responses.items() if v['status'] == status}
 
 
@@ -53,17 +53,18 @@ def read_log(req, db):
     if row and row[1] is None and row[2] is None:
         return dict(status='ok', key=row[3], value=row[4])
 
-    return dict(status='ok')
+    return dict(status='notfound')
 
 
 def read_log_state(req, db):
-    row = db.execute('select promised, accepted from log where seq=?',
-                     (req['seq'],)).fetchone()
+    row = db.execute('''select promised, accepted
+                        from log where seq=?
+                     ''', (req['seq'],)).fetchone()
 
     if row and row[0] is None and row[1] is None:
-        return dict(status='ok', learnt=True)
+        return dict(status='ok')
 
-    return dict(status='ok', learnt=False)
+    return dict(status='notfound')
 
 
 def read_key_state(req, db):
@@ -76,7 +77,7 @@ def read_key_state(req, db):
         if row[1] is None and row[2] is None:
             return dict(status='ok', seq=row[0])
 
-    return dict(status='NotFound')
+    return dict(status='notfound')
 
 
 def paxos_promise(req, db):
@@ -89,16 +90,21 @@ def paxos_promise(req, db):
     seq = row[0]
     if row[1] is None and row[2] is None:
         seq = row[0] + 1
-
-    row = db.execute('select * from log where seq=?', (seq,)).fetchone()
-    if not row:
         db.execute('insert into log(seq,promised,accepted) values(?,0,0)',
                    (seq,))
-        row = db.execute('select * from log where seq=?', (seq,)).fetchone()
+
+    row = db.execute('select * from log where seq=?', (seq,)).fetchone()
 
     # Our promise_seq is not bigger than the existing one. Terminate now.
     if req['promised'] <= row[1]:
         return dict(status='InvalidSeq')
+
+    key_seq = None
+    if req['key'] is not None:
+        tmp = db.execute('''select seq from log where key=?
+                            order by seq desc limit 1
+                         ''', (req['key'],)).fetchone()
+        key_seq = tmp[0] if tmp else 0
 
     # Our promise seq is largest seen so far for this log seq.
     # Update promise seq and return current accepted values.
@@ -109,7 +115,7 @@ def paxos_promise(req, db):
     db.commit()
 
     return dict(status='ok', seq=seq, accepted=row[2],
-                key=row[3], value=row[4])
+                key=row[3], value=row[4], key_seq=key_seq)
 
 
 def paxos_accept(req, db):
@@ -120,16 +126,8 @@ def paxos_accept(req, db):
 
     if not row:
         db.execute('insert into log(seq) values(?)', (req['seq'],))
-    elif req['promised'] < row[0]:
+    elif row[0] is None or req['promised'] < row[0]:
         return dict(status='InvalidSeq')
-
-    # Optimistic Locking Validation
-    if req['key'] and req['version']:
-        row = db.execute('''select seq from log where key=?
-                            order by seq desc limit 1
-                         ''', (req['key'],)).fetchone()
-        if row and row[0] != req['version']:
-            return dict(status='Conflict', seq=row[0])
 
     # All good. Accept this proposal. If a quorum reaches this step, this value
     # is learned. This seq -> value mapping is now permanent.
@@ -170,10 +168,11 @@ async def paxos_propose(req):
     ts = int(time.time())
 
     # Promise Phase
-    responses = await rpc({s: dict(action='promise', db=req['db'], promised=ts)
-                           for s in ARGS.servers})
+    responses = await mrpc({
+        s: dict(action='promise', db=req['db'], promised=ts, key=req['key'])
+        for s in ARGS.servers})
 
-    tmp = status_filter('ok', responses)
+    tmp = rpc_filter('ok', responses)
     counts = dict()
     responses = dict()
     for k, v in tmp.items():
@@ -181,10 +180,10 @@ async def paxos_propose(req):
 
         if len(counts[v['seq']]) == quorum:
             seq = v['seq']
-            responses = {k: v for k, v in tmp.items() if seq == v['seq']}
+            responses = {x: y for x, y in tmp.items() if seq == y['seq']}
 
     if len(responses) < quorum:
-        return dict(status='NoPromiseQuorum', seq=0)
+        return dict(status='NoPromiseQuorum')
 
     # Find the best proposal that was already accepted in some previous round
     # We must discard our proposal and use that. KEY paxos step.
@@ -194,37 +193,38 @@ async def paxos_propose(req):
         if res['accepted'] and res['accepted'] > proposal[0]:
             proposal = (res['accepted'], res['key'], res['value'])
 
+    # Optimistic Locking
+    if 0 == proposal[0] and req['version'] is not None:
+        tmp = [v['key_seq'] for v in responses.values()
+               if v['key_seq'] is not None]
+        tmp = max(tmp) if tmp else 0
+        if tmp != req['version']:
+            return dict(status='Conflict', seq=tmp)
+
     # Accept Phase
-    version = 0 if proposal[0] else req['version']
-    responses = await rpc({s: dict(action='accept', db=req['db'], seq=seq,
-                                   promised=ts,
-                                   key=proposal[1], value=proposal[2],
-                                   version=version)
-                           for s in ARGS.servers})
-
-    # Check if we were not lucky enough to get Optimistic Lock
-    for k, v in status_filter('Conflict', responses).items():
-        return dict(status='Conflict', seq=v['seq'])
-
-    responses = status_filter('ok', responses)
+    responses = await mrpc({s: dict(action='accept', db=req['db'], seq=seq,
+                                    promised=ts,
+                                    key=proposal[1], value=proposal[2])
+                            for s in ARGS.servers})
+    responses = rpc_filter('ok', responses)
 
     if len(responses) < quorum:
-        return dict(status='NoAcceptQuorum', seq=0)
+        return dict(status='NoAcceptQuorum')
 
     # Learn Phase
     requests = dict()
-    for s in responses:
-        requests[s] = dict(action='learn', db=req['db'], seq=seq, promised=ts)
-
     for s in ARGS.servers:
-        if s not in requests:
-            requests[s] = dict(action='learn', db=req['db'], seq=seq,
-                               key=proposal[1], value=proposal[2])
-    await rpc(requests)
+        requests[s] = dict(action='learn', db=req['db'], seq=seq)
 
-    return dict(
-        status='ok' if 0 == proposal[0] else 'ProposalConflict',
-        seq=seq if 0 == proposal[0] else 0)
+        if s in responses:
+            requests[s].update(dict(promised=ts))
+        else:
+            requests[s].update(dict(key=proposal[1], value=proposal[2]))
+
+    await mrpc(requests)
+
+    return dict(status='ok' if 0 == proposal[0] else 'ProposalConflict',
+                seq=seq if 0 == proposal[0] else 0)
 
 
 def server():
@@ -322,83 +322,78 @@ def server():
 
 
 async def put(servers, db, value, key=None, version=0):
-    srvrs = [(hashlib.md5((db + str(s)).encode()).digest(), s)
-             for s in servers]
+    srvs = [(hashlib.md5((db + str(s)).encode()).digest(), s) for s in servers]
 
-    if key is None:
-        key = hashlib.sha256(value).hexdigest()
-
-    for _, s in sorted(srvrs):
+    for _, s in sorted(srvs):
         try:
-            res = await _rpc(s, dict(action='propose', db=db,
-                                     key=key, version=version, value=value))
+            res = await rpc(s, dict(action='propose', db=db, key=key,
+                                    version=version, value=value))
 
             if 'ok' != res['status']:
                 return dict(status=res['status'])
 
             return dict(status=res['status'], version=res['seq'])
         except Exception:
-            continue
+            pass
 
 
 async def sync(servers, db, seq=1):
+    # Exponential backoff
+    sleep_sec = 0
+
     while True:
-        ok = False
+        sleep_sec = max(1, min(15, 2*sleep_sec))
 
         try:
-            res = await rpc({s: dict(action='read_log_state', db=db, seq=seq)
-                             for s in servers})
+            res = await mrpc({s: dict(action='read_log_state', db=db, seq=seq)
+                              for s in servers})
 
-            srvrs = [k for k, v in res.items() if not v['learnt']]
+            srvs = set(servers) - set(rpc_filter('ok', res))
 
-            for k, v in res.items():
-                if v['learnt']:
-                    r = await _rpc(k, dict(action='read_log', db=db, seq=seq))
+            for srv in rpc_filter('ok', res):
+                r = await rpc(srv, dict(action='read_log', db=db, seq=seq))
 
-                    if srvrs:
-                        await rpc({s: dict(action='learn', db=db, seq=seq,
-                                           key=r['key'], value=r['value'])
-                                   for s in srvrs})
+                await mrpc({s: dict(action='learn', db=db, seq=seq,
+                                    key=r['key'], value=r['value'])
+                            for s in srvs})
 
-                    seq += 1
-                    ok = True
-                    print((time.strftime('%H:%M:%S'), r['key'], seq,
-                           len(r['value']), srvrs))
-                    break
+                print((time.strftime('%H:%M:%S'), seq, r['key'],
+                       len(r['value']), srvs))
+
+                seq += 1
+                sleep_sec = 0
+                break
         except Exception:
             pass
 
-        if not ok:
-            time.sleep(5)
+        if sleep_sec > 0:
+            print('sleeping for {} sec'.format(sleep_sec))
+            time.sleep(sleep_sec)
 
 
 async def get(servers, db, key, existing_version=0):
     quorum = int(len(servers)/2) + 1
 
-    responses = await rpc({s: dict(action='read_key_state', db=db, key=key)
-                           for s in servers})
-
-    if len(status_filter('NotFound', responses)) >= quorum:
-        return dict(status='NotFound')
-
-    responses = status_filter('ok', responses)
+    responses = await mrpc({s: dict(action='read_key_state', db=db, key=key)
+                            for s in servers})
 
     if len(responses) < quorum:
-        return dict(status='NoQuorum')
+        return dict(status='noquorum')
 
-    best = None
+    if len(rpc_filter('notfound', responses)) >= quorum:
+        return dict(status='notfound')
+
+    responses = rpc_filter('ok', responses)
+
+    max_seq = max([v['seq'] for v in responses.values()])
+
+    if max_seq == existing_version:
+        return dict(status='ok', version=max_seq, value=None)
+
     for k, v in responses.items():
-        if v['seq'] > responses.get(best, dict(seq=0))['seq']:
-            best = k
-
-    seq = responses[best]['seq']
-
-    if existing_version != seq:
-        res = await _rpc(best, dict(action='read_log', db=db, seq=seq))
-    else:
-        res = dict(value=None)
-
-    return dict(status='ok', version=seq, value=res['value'])
+        if v['seq'] == max_seq:
+            res = await rpc(k, dict(action='read_log', db=db, seq=max_seq))
+            return dict(status='ok', version=max_seq, value=res['value'])
 
 
 def call_sync(obj):
@@ -430,7 +425,7 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
-    ARGS.add_argument('--version', dest='version', type=int, default=0)
+    ARGS.add_argument('--version', dest='version', type=int)
 
     ARGS.add_argument('--port', dest='port', type=int)
     ARGS.add_argument('--servers', dest='servers',
@@ -447,10 +442,9 @@ if __name__ == '__main__':
         init(ARGS.db, ARGS.passwd)
     elif ARGS.sync:
         call_sync(sync(ARGS.servers, ARGS.db, ARGS.sync))
-    elif not ARGS.key or ARGS.value:
-        if not ARGS.key:
-            # This is only for testing - Pick a random value
-            ARGS.value = str(time.time()*10**6)
+    elif ARGS.value:
+        if ARGS.version:
+            ARGS.version = int(ARGS.version)
 
         print(call_sync(put(ARGS.servers, ARGS.db,
                             ARGS.value.encode(), ARGS.key, ARGS.version)))
