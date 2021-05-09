@@ -336,6 +336,8 @@ async def put(servers, db, value, key=None, version=0):
         except Exception:
             pass
 
+    return dict(status='unavailable')
+
 
 async def sync(servers, db, seq=1):
     # Exponential backoff
@@ -353,9 +355,10 @@ async def sync(servers, db, seq=1):
             for srv in rpc_filter('ok', res):
                 r = await rpc(srv, dict(action='read_log', db=db, seq=seq))
 
-                await mrpc({s: dict(action='learn', db=db, seq=seq,
-                                    key=r['key'], value=r['value'])
-                            for s in srvs})
+                if srvs:
+                    await mrpc({s: dict(action='learn', db=db, seq=seq,
+                                        key=r['key'], value=r['value'])
+                                for s in srvs})
 
                 print((time.strftime('%H:%M:%S'), seq, r['key'],
                        len(r['value']), srvs))
