@@ -83,20 +83,27 @@ def read_key_state(req, db):
 def paxos_promise(req, db):
     db.execute('update log set key=0 where seq=0')
 
-    row = db.execute('''select seq, promised, accepted from log
-                        order by seq desc limit 1
-                     ''').fetchone()
+    if 'seq' in req:
+        seq = req['seq']
+        row = db.execute('select seq from log where seq=?', (seq,)).fetchone()
+        if not row:
+            db.execute('insert into log(seq,promised,accepted) values(?,0,0)',
+                       (seq,))
+    else:
+        row = db.execute('''select seq, promised, accepted from log
+                            order by seq desc limit 1
+                         ''').fetchone()
+        seq = row[0]
 
-    seq = row[0]
-    if row[1] is None and row[2] is None:
-        seq = row[0] + 1
-        db.execute('insert into log(seq,promised,accepted) values(?,0,0)',
-                   (seq,))
+        if row[1] is None and row[2] is None:
+            seq = row[0] + 1
+            db.execute('insert into log(seq,promised,accepted) values(?,0,0)',
+                       (seq,))
 
     row = db.execute('select * from log where seq=?', (seq,)).fetchone()
 
     # Our promise_seq is not bigger than the existing one. Terminate now.
-    if req['promised'] <= row[1]:
+    if row[1] is None or req['promised'] <= row[1]:
         return dict(status='InvalidSeq')
 
     key_seq = None
@@ -168,22 +175,23 @@ async def paxos_propose(req):
     ts = int(time.time())
 
     # Promise Phase
-    responses = await mrpc({
-        s: dict(action='promise', db=req['db'], promised=ts, key=req['key'])
-        for s in ARGS.servers})
+    if 'seq' in req:
+        responses = await mrpc({
+            s: dict(action='promise', db=req['db'], promised=ts,
+                    seq=req['seq'], key=None)
+            for s in ARGS.servers})
+    else:
+        responses = await mrpc({
+            s: dict(action='promise', db=req['db'], promised=ts,
+                    key=req['key'])
+            for s in ARGS.servers})
 
-    tmp = rpc_filter('ok', responses)
-    counts = dict()
-    responses = dict()
-    for k, v in tmp.items():
-        counts.setdefault(v['seq'], list()).append(k)
-
-        if len(counts[v['seq']]) == quorum:
-            seq = v['seq']
-            responses = {x: y for x, y in tmp.items() if seq == y['seq']}
-
+    responses = rpc_filter('ok', responses)
     if len(responses) < quorum:
         return dict(status='NoPromiseQuorum')
+
+    seq = max([v['seq'] for v in responses.values()])
+    responses = {k: v for k, v in responses.items() if seq == v['seq']}
 
     # Find the best proposal that was already accepted in some previous round
     # We must discard our proposal and use that. KEY paxos step.
@@ -227,7 +235,7 @@ async def paxos_propose(req):
                 seq=seq if 0 == proposal[0] else 0)
 
 
-def server():
+async def server():
     # This would avoid creation of any zombie processes
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 
@@ -292,7 +300,7 @@ def server():
     if 'propose' == req['action']:
         fcntl.flock(os.open('paxolite.propose.lock', os.O_CREAT | os.O_RDONLY),
                     fcntl.LOCK_EX)
-        res = call_sync(paxos_propose(req))
+        res = await paxos_propose(req)
         req.pop('value')
 
     elif req['action'] in ('promise', 'accept', 'learn'):
@@ -320,6 +328,51 @@ def server():
     req.pop('value', None)
     log('client%s %s', addr, req)
 
+    # Fill any missing values
+    try:
+        if 'learn' != req['action']:
+            return
+
+        fcntl.flock(os.open('paxolite.sync.lock', os.O_CREAT | os.O_RDONLY),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        return
+
+    # Find out the holes in seq column, and
+    # incomplete paxos rounds where a peer might have already learned
+    rows = db.execute('''select seq+1 from log
+                         where seq+1 not in (select seq from log)
+                         union
+                         select seq from log
+                         where promised is not null
+                      ''').fetchall()
+
+    for seq in sorted([row[0] for row in rows])[:-1]:
+        # Check which servers have learned this log entry already
+        res = await mrpc({s: dict(action='read_log_state', db=req['db'],
+                                  seq=seq)
+                          for s in ARGS.servers})
+
+        for srv in rpc_filter('ok', res):
+            # Yes. This server has learned the log entry
+            r = await rpc(srv, dict(action='read_log', db=req['db'],
+                                    seq=seq))
+
+            # We successfully fetched the value. Lets update our database
+            if 'value' in r:
+                paxos_learn(dict(seq=seq, key=r['key'], value=r['value']),
+                            db)
+
+    # Find out incomplete paxos rounds, where no peer has learned the value
+    # or all peers with learned value are down at the moment
+    rows = db.execute('''select seq from log
+                         where promised is not null
+                         order by seq
+                      ''').fetchall()
+    for row in rows:
+        await paxos_propose(dict(db=req['db'], seq=row[0],
+                                 key=None, value=None))
+
 
 async def put(servers, db, value, key=None, version=0):
     srvs = [(hashlib.md5((db + str(s)).encode()).digest(), s) for s in servers]
@@ -340,32 +393,24 @@ async def put(servers, db, value, key=None, version=0):
 
 
 async def sync(servers, db, seq=1):
-    # Exponential backoff
     sleep_sec = 0
 
     while True:
+        # Exponential backoff
         sleep_sec = max(1, min(15, 2*sleep_sec))
 
         try:
-            res = await mrpc({s: dict(action='read_log_state', db=db, seq=seq)
-                              for s in servers})
-
-            srvs = set(servers) - set(rpc_filter('ok', res))
-
-            for srv in rpc_filter('ok', res):
+            for i in range(len(servers)):
+                srv = servers[int(time.time()*10**6) % len(servers)]
                 r = await rpc(srv, dict(action='read_log', db=db, seq=seq))
 
-                if srvs:
-                    await mrpc({s: dict(action='learn', db=db, seq=seq,
-                                        key=r['key'], value=r['value'])
-                                for s in srvs})
+                if 'value' in r:
+                    print((time.strftime('%H:%M:%S'), seq, r['key'],
+                           len(r['value']), srv))
 
-                print((time.strftime('%H:%M:%S'), seq, r['key'],
-                       len(r['value']), srvs))
-
-                seq += 1
-                sleep_sec = 0
-                break
+                    seq += 1
+                    sleep_sec = 0
+                    break
         except Exception:
             pass
 
@@ -440,7 +485,7 @@ if __name__ == '__main__':
                     for s in ARGS.servers.split(',')]
 
     if ARGS.port:
-        server()
+        call_sync(server())
     elif ARGS.passwd:
         init(ARGS.db, ARGS.passwd)
     elif ARGS.sync:

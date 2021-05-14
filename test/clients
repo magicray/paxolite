@@ -1,0 +1,12 @@
+#!/bin/bash
+
+function test_client {
+    while true; do
+        python3 ~/paxolite/paxolite.py --value $(date +%s)
+        python3 ~/paxolite/paxolite.py --key $(date +%y%m%d-%H%M) --value $(date +%s)
+    done
+}
+
+for i in $(seq 30); do
+    test_client &
+done
