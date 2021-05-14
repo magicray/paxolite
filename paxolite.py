@@ -56,22 +56,11 @@ def read_log(req, db):
     return dict(status='notfound')
 
 
-def read_log_state(req, db):
-    row = db.execute('''select promised, accepted
-                        from log where seq=?
-                     ''', (req['seq'],)).fetchone()
-
-    if row and row[0] is None and row[1] is None:
-        return dict(status='ok')
-
-    return dict(status='notfound')
-
-
-def read_key_state(req, db):
+def read_key(req, db):
     rows = db.execute('''select seq, promised, accepted
                          from log
                          where key=? order by seq desc
-                      ''', (req['key'],)).fetchall()
+                      ''', (req['key'],))
 
     for row in rows:
         if row[1] is None and row[2] is None:
@@ -276,20 +265,21 @@ async def server():
             hdr[k.lower()] = v.strip()
 
         version = int(hdr.get('if-none-match', '"0"')[1:-1])
-        status, ver, value = call_sync(get(ARGS.servers, db, key, version))
+        r = await get(ARGS.servers, db, key, version)
 
-        if status != 'ok':
+        if 'ok' != r['status']:
             conn.sendall('HTTP/1.1 404 Not Found\n\n'.encode())
-        elif ver == version:
+        elif version == r['version']:
             conn.sendall('HTTP/1.1 304 Not Modified\n'.encode())
-            conn.sendall('ETag: "{}"\n\n'.format(ver).encode())
+            conn.sendall('ETag: "{}"\n\n'.format(r['version']).encode())
         else:
             mime_type = mimetypes.guess_type(key)[0]
             mime_type = mime_type if mime_type else 'text/plain'
-            conn.sendall('HTTP/1.1 200 OK\nETag: "{}"\n'.format(ver).encode())
-            conn.sendall('Content-Type: {}\n'.format(mime_type).encode())
-            conn.sendall('Content-Length: {}\n\n'.format(len(value)).encode())
-            conn.sendall(value)
+            conn.sendall('HTTP/1.1 200 OK\n'.encode())
+            conn.sendall('ETag: "{}"\n'.format(r['version']).encode())
+            conn.sendall('Content-Type: {}\nContent-Length: {}\n\n'.format(
+                mime_type, len(r['value'])).encode())
+            conn.sendall(r['value'])
 
         return conn.close()
 
@@ -311,11 +301,10 @@ async def server():
                 promise=paxos_promise,
             )[req['action']](req, db)
 
-    elif req['action'] in ('read_log', 'read_log_state', 'read_key_state'):
+    elif req['action'] in ('read_log', 'read_key'):
         res = dict(
             read_log=read_log,
-            read_log_state=read_log_state,
-            read_key_state=read_key_state
+            read_key=read_key
         )[req['action']](req, db)
 
     else:
@@ -328,18 +317,17 @@ async def server():
     req.pop('value', None)
     log('client%s %s', addr, req)
 
-    # Fill any missing values
-    try:
-        if 'learn' != req['action']:
-            return
+    if 'learn' != req['action']:
+        return
 
+    # Rest of the code is to fix any inconsistencies in the log
+    try:
         fcntl.flock(os.open('paxolite.sync.lock', os.O_CREAT | os.O_RDONLY),
                     fcntl.LOCK_EX | fcntl.LOCK_NB)
     except Exception:
         return
 
-    # Find out the holes in seq column, and
-    # incomplete paxos rounds where a peer might have already learned
+    # Find out holes and incomplete paxos entries in the log
     rows = db.execute('''select seq+1 from log
                          where seq+1 not in (select seq from log)
                          union
@@ -348,33 +336,32 @@ async def server():
                       ''').fetchall()
 
     for seq in sorted([row[0] for row in rows])[:-1]:
-        # Check which servers have learned this log entry already
-        res = await mrpc({s: dict(action='read_log_state', db=req['db'],
-                                  seq=seq)
-                          for s in ARGS.servers})
+        learned = False
 
-        for srv in rpc_filter('ok', res):
-            # Yes. This server has learned the log entry
-            r = await rpc(srv, dict(action='read_log', db=req['db'],
-                                    seq=seq))
+        for srv in ARGS.servers:
+            r = await rpc(srv, dict(action='read_log', db=req['db'], seq=seq))
 
-            # We successfully fetched the value. Lets update our database
             if 'value' in r:
-                paxos_learn(dict(seq=seq, key=r['key'], value=r['value']),
-                            db)
+                # Log entry successfully fetched, update the db
+                paxos_learn(dict(seq=seq, key=r['key'], value=r['value']), db)
+                learned = True
+                break
 
-    # Find out incomplete paxos rounds, where no peer has learned the value
-    # or all peers with learned value are down at the moment
-    rows = db.execute('''select seq from log
-                         where promised is not null
-                         order by seq
-                      ''').fetchall()
-    for row in rows:
-        await paxos_propose(dict(db=req['db'], seq=row[0],
-                                 key=None, value=None))
+        if not learned:
+            await paxos_propose(dict(db=req['db'], seq=seq,
+                                     key=None, value=None))
 
 
 async def put(servers, db, value, key=None, version=0):
+    # This requires some explanation.
+    #
+    # We want only one server to drive the writes, as conflicts in
+    # paxos rounds lead to live-lock like situation, significantly
+    # delaying writes. We try servers in a fixed sequence, to ensure
+    # requests land on the same server from all the clients.
+    #
+    # To still distribute load evenly, the sequence of server we follow for
+    # each db is different.
     srvs = [(hashlib.md5((db + str(s)).encode()).digest(), s) for s in servers]
 
     for _, s in sorted(srvs):
@@ -393,14 +380,11 @@ async def put(servers, db, value, key=None, version=0):
 
 
 async def sync(servers, db, seq=1):
-    sleep_sec = 0
-
     while True:
-        # Exponential backoff
-        sleep_sec = max(1, min(15, 2*sleep_sec))
+        sleep = True
 
-        try:
-            for i in range(len(servers)):
+        for i in range(len(servers)):
+            try:
                 srv = servers[int(time.time()*10**6) % len(servers)]
                 r = await rpc(srv, dict(action='read_log', db=db, seq=seq))
 
@@ -409,20 +393,19 @@ async def sync(servers, db, seq=1):
                            len(r['value']), srv))
 
                     seq += 1
-                    sleep_sec = 0
+                    sleep = False
                     break
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        if sleep_sec > 0:
-            print('sleeping for {} sec'.format(sleep_sec))
-            time.sleep(sleep_sec)
+        if sleep:
+            time.sleep(5)
 
 
 async def get(servers, db, key, existing_version=0):
     quorum = int(len(servers)/2) + 1
 
-    responses = await mrpc({s: dict(action='read_key_state', db=db, key=key)
+    responses = await mrpc({s: dict(action='read_key', db=db, key=key)
                             for s in servers})
 
     if len(responses) < quorum:
@@ -433,15 +416,17 @@ async def get(servers, db, key, existing_version=0):
 
     responses = rpc_filter('ok', responses)
 
-    max_seq = max([v['seq'] for v in responses.values()])
+    seq = max([v['seq'] for v in responses.values()])
 
-    if max_seq == existing_version:
-        return dict(status='ok', version=max_seq, value=None)
+    if seq == existing_version:
+        return dict(status='ok', version=seq, value=None)
 
     for k, v in responses.items():
-        if v['seq'] == max_seq:
-            res = await rpc(k, dict(action='read_log', db=db, seq=max_seq))
-            return dict(status='ok', version=max_seq, value=res['value'])
+        if v['seq'] == seq:
+            r = await rpc(k, dict(action='read_log', db=db, seq=seq))
+            return dict(status='ok', version=seq, value=r['value'])
+
+    return dict(status='unavailable')
 
 
 def call_sync(obj):
