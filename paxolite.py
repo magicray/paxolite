@@ -336,7 +336,7 @@ async def server():
         )[req['action']](req, db)
 
     else:
-        res = dict(status='NotAllowed')
+        res = dict(status='notallowed')
 
     req.update(res)
     conn.sendall(pickle.dumps(req))
@@ -408,8 +408,35 @@ async def put(servers, db, value, key=None, version=0):
     return dict(status='unavailable')
 
 
-async def sync(servers, src, dst):
-    db = create_schema(dst)
+async def get(servers, db, key, existing_version=0):
+    quorum = int(len(servers)/2) + 1
+
+    responses = await mrpc({s: dict(action='read_key', db=db, key=key)
+                            for s in servers})
+
+    if len(responses) < quorum:
+        return dict(status='noquorum')
+
+    if len(rpc_filter('notfound', responses)) >= quorum:
+        return dict(status='notfound')
+
+    responses = rpc_filter('ok', responses)
+
+    seq = max([v['seq'] for v in responses.values()])
+
+    if seq == existing_version:
+        return dict(status='ok', version=seq, value=None)
+
+    for k, v in responses.items():
+        if v['seq'] == seq:
+            r = await rpc(k, dict(action='read_log', db=db, seq=seq))
+            return dict(status='ok', version=seq, value=r['value'])
+
+    return dict(status='unavailable')
+
+
+async def watch(servers, src):
+    db = create_schema(src)
     seq = 2
     row = db.execute('select max(seq) from log').fetchone()
 
@@ -443,34 +470,7 @@ async def sync(servers, src, dst):
             time.sleep(5)
 
 
-async def get(servers, db, key, existing_version=0):
-    quorum = int(len(servers)/2) + 1
-
-    responses = await mrpc({s: dict(action='read_key', db=db, key=key)
-                            for s in servers})
-
-    if len(responses) < quorum:
-        return dict(status='noquorum')
-
-    if len(rpc_filter('notfound', responses)) >= quorum:
-        return dict(status='notfound')
-
-    responses = rpc_filter('ok', responses)
-
-    seq = max([v['seq'] for v in responses.values()])
-
-    if seq == existing_version:
-        return dict(status='ok', version=seq, value=None)
-
-    for k, v in responses.items():
-        if v['seq'] == seq:
-            r = await rpc(k, dict(action='read_log', db=db, seq=seq))
-            return dict(status='ok', version=seq, value=r['value'])
-
-    return dict(status='unavailable')
-
-
-def call_sync(obj):
+def sync(obj):
     return asyncio.get_event_loop().run_until_complete(obj)
 
 
@@ -500,7 +500,6 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--db', dest='db', default='default')
     ARGS.add_argument('--passwd', dest='passwd')
-    ARGS.add_argument('--sync', dest='sync')
 
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
@@ -516,18 +515,13 @@ if __name__ == '__main__':
                     for s in ARGS.servers.split(',')]
 
     if ARGS.port:
-        call_sync(server())
+        sync(server())
     elif ARGS.passwd:
         init(ARGS.db, ARGS.passwd)
-    elif ARGS.sync:
-        call_sync(sync(ARGS.servers, ARGS.db, ARGS.sync))
     elif ARGS.value:
-        if ARGS.version:
-            ARGS.version = int(ARGS.version)
-
-        print(call_sync(put(ARGS.servers, ARGS.db,
-                            ARGS.value.encode(), ARGS.key, ARGS.version)))
+        print(sync(put(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
+                       int(ARGS.version) if ARGS.version else ARGS.version)))
     elif ARGS.key:
-        print(call_sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
+        print(sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
     else:
-        print('invalid command')
+        sync(watch(ARGS.servers, ARGS.db))
