@@ -1,5 +1,7 @@
 import os
 import time
+import hmac
+import uuid
 import fcntl
 import pickle
 import socket
@@ -25,6 +27,7 @@ async def rpc(server, req):
     writer.close()
 
     tmp = res.copy()
+    tmp.pop('auth', None)
     tmp.pop('value', None)
     log('server%s %s', server, tmp)
 
@@ -48,6 +51,9 @@ def rpc_filter(status, responses):
 
 
 def read_log(req, db):
+    if req['seq'] < 2:
+        return dict(status='notallowed')
+
     row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
 
     if row and row[1] is None and row[2] is None:
@@ -161,7 +167,7 @@ def paxos_learn(req, db):
     return dict(status='ok')
 
 
-async def paxos_propose(req):
+async def paxos_propose(req, db):
     quorum = int(len(ARGS.servers)/2) + 1
 
     # We use current timestamp as the paxos seq number
@@ -180,9 +186,14 @@ async def paxos_propose(req):
 
         seq = max([v['next_seq'] for v in responses.values()])
 
+    # Authecation - calculate HMAC of seq with the secret code
+    auth = hmac.new(
+        db.execute('select value from log where seq=0').fetchone()[0].encode(),
+        str(seq).encode(), hashlib.sha512).hexdigest()
+
     # Promise Phase
     responses = await mrpc({s: dict(action='promise', db=req['db'], seq=seq,
-                                    promised=ts, key=req['key'])
+                                    promised=ts, key=req['key'], auth=auth)
                             for s in ARGS.servers})
     responses = rpc_filter('ok', responses)
 
@@ -207,7 +218,7 @@ async def paxos_propose(req):
 
     # Accept Phase
     responses = await mrpc({s: dict(action='accept', db=req['db'], seq=seq,
-                                    promised=ts,
+                                    promised=ts, auth=auth,
                                     key=proposal[1], value=proposal[2])
                             for s in ARGS.servers})
     responses = rpc_filter('ok', responses)
@@ -218,7 +229,7 @@ async def paxos_propose(req):
     # Learn Phase
     requests = dict()
     for s in ARGS.servers:
-        requests[s] = dict(action='learn', db=req['db'], seq=seq)
+        requests[s] = dict(action='learn', db=req['db'], seq=seq, auth=auth)
 
         if s in responses:
             requests[s].update(dict(promised=ts))
@@ -258,7 +269,8 @@ async def server():
     fd = conn.makefile(mode='rb')
     line = fd.readline().decode().strip()
 
-    # HTTP Server
+    # Trivial HTTP Server
+    # Supports only GET method with ETag header
     if line:
         _, url, _ = line.split(' ')
         db, key = urllib.parse.unquote(url.strip('/')).split('/')
@@ -297,16 +309,24 @@ async def server():
     if 'propose' == req['action']:
         fcntl.flock(os.open('paxolite.propose.lock', os.O_CREAT | os.O_RDONLY),
                     fcntl.LOCK_EX)
-        res = await paxos_propose(req)
+        res = await paxos_propose(req, db)
         req.pop('value')
 
     elif req['action'] in ('promise', 'accept', 'learn'):
         if addr[0] in [ip for ip, port in ARGS.servers]:
-            res = dict(
-                learn=paxos_learn,
-                accept=paxos_accept,
-                promise=paxos_promise,
-            )[req['action']](req, db)
+            # Authecation - calculate HMAC of seq with the secret code
+            key = db.execute('select value from log where seq=0').fetchone()[0]
+            auth = hmac.new(key.encode(), str(req['seq']).encode(),
+                            hashlib.sha512).hexdigest()
+
+            if req['auth'] == auth:
+                res = dict(
+                    learn=paxos_learn,
+                    accept=paxos_accept,
+                    promise=paxos_promise,
+                )[req['action']](req, db)
+            else:
+                res = dict(status='unauthorized')
 
     elif req['action'] in ('read_log', 'read_key', 'read_info'):
         res = dict(
@@ -322,6 +342,7 @@ async def server():
     conn.sendall(pickle.dumps(req))
     conn.close()
 
+    req.pop('auth', None)
     req.pop('value', None)
     log('client%s %s', addr, req)
 
@@ -357,7 +378,7 @@ async def server():
 
         if not learned:
             await paxos_propose(dict(db=req['db'], seq=seq,
-                                     key=None, value=None))
+                                     key=None, value=None), db)
 
 
 async def put(servers, db, value, key=None, version=0):
@@ -387,18 +408,30 @@ async def put(servers, db, value, key=None, version=0):
     return dict(status='unavailable')
 
 
-async def sync(servers, db, seq=1):
+async def sync(servers, src, dst):
+    db = create_schema(dst)
+    seq = 2
+    row = db.execute('select max(seq) from log').fetchone()
+
+    if row[0]:
+        seq = row[0] + 1
+
     while True:
         sleep = True
 
         for i in range(len(servers)):
             try:
                 srv = servers[int(time.time()*10**6) % len(servers)]
-                r = await rpc(srv, dict(action='read_log', db=db, seq=seq))
+                r = await rpc(srv, dict(action='read_log', db=src, seq=seq))
 
                 if 'value' in r:
-                    print((time.strftime('%H:%M:%S'), seq, r['key'],
-                           len(r['value']), srv))
+                    db.execute('insert into log(seq,key,value) values(?,?,?)',
+                               (seq, r['key'], r['value']))
+                    db.commit()
+
+                    print('time({}) seq({}) key({}) bytes({})'.format(
+                        time.strftime('%H:%M:%S'), seq, r['key'],
+                        len(r['value'])))
 
                     seq += 1
                     sleep = False
@@ -441,9 +474,8 @@ def call_sync(obj):
     return asyncio.get_event_loop().run_until_complete(obj)
 
 
-def init(db, passwd):
+def create_schema(db):
     db = sqlite3.connect('paxolite.' + db + '.sqlite3')
-
     db.execute('''create table if not exists log(
         seq      integer primary key autoincrement,
         promised integer,
@@ -451,8 +483,14 @@ def init(db, passwd):
         key      text,
         value    blob)''')
     db.execute('create index if not exists i1 on log(key, seq)')
-    db.execute('insert into log(seq, value) values(0,?)',
-               (passwd,))
+    db.execute('create index if not exists i2 on log(promised, seq)')
+    return db
+
+
+def init(db, passwd=None):
+    db = create_schema(db)
+    db.execute('insert into log(seq, value) values(0,?)', (uuid.uuid4().hex,))
+    db.execute('insert into log(seq, value) values(1,?)', (passwd,))
     db.commit()
 
 
@@ -462,7 +500,7 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--db', dest='db', default='default')
     ARGS.add_argument('--passwd', dest='passwd')
-    ARGS.add_argument('--sync', dest='sync', type=int)
+    ARGS.add_argument('--sync', dest='sync')
 
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
@@ -489,5 +527,7 @@ if __name__ == '__main__':
 
         print(call_sync(put(ARGS.servers, ARGS.db,
                             ARGS.value.encode(), ARGS.key, ARGS.version)))
-    else:
+    elif ARGS.key:
         print(call_sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
+    else:
+        print('invalid command')
