@@ -16,77 +16,17 @@ import urllib.parse
 from logging import critical as log
 
 
-async def rpc(server, req):
-    reader, writer = await asyncio.open_connection(server[0], server[1])
-
-    writer.write(b'\n')
-    writer.write(pickle.dumps(req))
-    await writer.drain()
-
-    res = pickle.loads((await reader.read()))
-    writer.close()
-
-    tmp = res.copy()
-    tmp.pop('auth', None)
-    tmp.pop('value', None)
-    log('server%s %s', server, tmp)
-
-    res['server'] = server
-    return res
-
-
-async def mrpc(server_req_map):
-    tasks = [rpc(k, v) for k, v in server_req_map.items()]
-
-    responses = dict()
-    for res in await asyncio.gather(*tasks, return_exceptions=True):
-        if type(res) is dict:
-            responses[res['server']] = res
-
-    return responses
-
-
-def rpc_filter(status, responses):
-    return {k: v for k, v in responses.items() if v['status'] == status}
-
-
-def read_log(req, db):
-    if req['seq'] < 2:
-        return dict(status='notallowed')
-
-    row = db.execute('select * from log where seq=?', (req['seq'],)).fetchone()
-
-    if row and row[1] is None and row[2] is None:
-        return dict(status='ok', key=row[3], value=row[4])
-
-    return dict(status='notfound')
-
-
-def read_key(req, db):
-    rows = db.execute('''select seq, promised, accepted
-                         from log
-                         where key=? order by seq desc
-                      ''', (req['key'],))
-
-    for row in rows:
-        if row[1] is None and row[2] is None:
-            return dict(status='ok', seq=row[0])
-
-    return dict(status='notfound')
-
-
-def read_info(req, db):
-    res = dict(status='ok')
-
-    row = db.execute('''select seq, promised, accepted from log
-                        order by seq desc limit 1
-                     ''').fetchone()
-    if row[1] is None and row[2] is None:
-        res['next_seq'] = row[0] + 1
-    else:
-        res['next_seq'] = row[0]
-
-    return res
+def create_schema(db):
+    db = sqlite3.connect('paxolite.' + db + '.sqlite3')
+    db.execute('''create table if not exists log(
+        seq      integer primary key autoincrement,
+        promised integer,
+        accepted integer,
+        key      text,
+        value    blob)''')
+    db.execute('create index if not exists i1 on log(key, seq)')
+    db.execute('create index if not exists i2 on log(promised, seq)')
+    return db
 
 
 def paxos_promise(req, db):
@@ -242,6 +182,32 @@ async def paxos_propose(req, db):
                 seq=seq if 0 == proposal[0] else 0)
 
 
+async def repair_log(req, db):
+    # Find out holes and incomplete paxos entries in the log
+    rows = db.execute('''select seq+1 from log
+                         where seq+1 not in (select seq from log)
+                         union
+                         select seq from log
+                         where promised is not null
+                      ''').fetchall()
+
+    for seq in sorted([row[0] for row in rows])[:-1]:
+        learned = False
+
+        for srv in ARGS.servers:
+            r = await rpc(srv, dict(action='read_log', db=req['db'], seq=seq))
+
+            if 'value' in r:
+                # Log entry successfully fetched, update the db
+                paxos_learn(dict(seq=seq, key=r['key'], value=r['value']), db)
+                learned = True
+                break
+
+        if not learned:
+            await paxos_propose(dict(db=req['db'], seq=seq,
+                                     key=None, value=None), db)
+
+
 async def server():
     # This would avoid creation of any zombie processes
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)
@@ -328,12 +294,35 @@ async def server():
             else:
                 res = dict(status='unauthorized')
 
-    elif req['action'] in ('read_log', 'read_key', 'read_info'):
-        res = dict(
-            read_log=read_log,
-            read_key=read_key,
-            read_info=read_info
-        )[req['action']](req, db)
+    elif 'read_log' == req['action'] and req['seq'] > 1:
+        row = db.execute('select * from log where seq=?',
+                         (req['seq'],)).fetchone()
+
+        res = dict(status='notfound')
+        if row and row[1] is None and row[2] is None:
+            res = dict(status='ok', key=row[3], value=row[4])
+
+    elif 'read_key' == req['action']:
+        rows = db.execute('''select seq, promised, accepted
+                             from log
+                             where key=? order by seq desc
+                          ''', (req['key'],))
+
+        res = dict(status='notfound')
+        for row in rows:
+            if row[1] is None and row[2] is None:
+                res = dict(status='ok', seq=row[0])
+                break
+
+    elif 'read_info' == req['action']:
+        row = db.execute('''select seq, promised, accepted from log
+                            order by seq desc limit 1
+                         ''').fetchone()
+
+        res = dict(status='ok', next_seq=row[0])
+
+        if row[1] is None and row[2] is None:
+            res['next_seq'] = row[0] + 1
 
     else:
         res = dict(status='notallowed')
@@ -346,39 +335,51 @@ async def server():
     req.pop('value', None)
     log('client%s %s', addr, req)
 
-    if 'learn' != req['action']:
-        return
-
-    # Rest of the code is to fix any inconsistencies in the log
     try:
-        fcntl.flock(os.open('paxolite.sync.lock', os.O_CREAT | os.O_RDONLY),
+        if 'learn' != req['action']:
+            return
+
+        fcntl.flock(os.open('paxolite.repair.lock', os.O_CREAT | os.O_RDONLY),
                     fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        # Fix inconsistencies in the log
+        await repair_log(req, db)
     except Exception:
-        return
+        pass
 
-    # Find out holes and incomplete paxos entries in the log
-    rows = db.execute('''select seq+1 from log
-                         where seq+1 not in (select seq from log)
-                         union
-                         select seq from log
-                         where promised is not null
-                      ''').fetchall()
 
-    for seq in sorted([row[0] for row in rows])[:-1]:
-        learned = False
+async def rpc(server, req):
+    reader, writer = await asyncio.open_connection(server[0], server[1])
 
-        for srv in ARGS.servers:
-            r = await rpc(srv, dict(action='read_log', db=req['db'], seq=seq))
+    writer.write(b'\n')
+    writer.write(pickle.dumps(req))
+    await writer.drain()
 
-            if 'value' in r:
-                # Log entry successfully fetched, update the db
-                paxos_learn(dict(seq=seq, key=r['key'], value=r['value']), db)
-                learned = True
-                break
+    res = pickle.loads((await reader.read()))
+    writer.close()
 
-        if not learned:
-            await paxos_propose(dict(db=req['db'], seq=seq,
-                                     key=None, value=None), db)
+    tmp = res.copy()
+    tmp.pop('auth', None)
+    tmp.pop('value', None)
+    log('server%s %s', server, tmp)
+
+    res['server'] = server
+    return res
+
+
+async def mrpc(server_req_map):
+    tasks = [rpc(k, v) for k, v in server_req_map.items()]
+
+    responses = dict()
+    for res in await asyncio.gather(*tasks, return_exceptions=True):
+        if type(res) is dict:
+            responses[res['server']] = res
+
+    return responses
+
+
+def rpc_filter(status, responses):
+    return {k: v for k, v in responses.items() if v['status'] == status}
 
 
 async def put(servers, db, value, key=None, version=0):
@@ -474,26 +475,6 @@ def sync(obj):
     return asyncio.get_event_loop().run_until_complete(obj)
 
 
-def create_schema(db):
-    db = sqlite3.connect('paxolite.' + db + '.sqlite3')
-    db.execute('''create table if not exists log(
-        seq      integer primary key autoincrement,
-        promised integer,
-        accepted integer,
-        key      text,
-        value    blob)''')
-    db.execute('create index if not exists i1 on log(key, seq)')
-    db.execute('create index if not exists i2 on log(promised, seq)')
-    return db
-
-
-def init(db, passwd=None):
-    db = create_schema(db)
-    db.execute('insert into log(seq, value) values(0,?)', (uuid.uuid4().hex,))
-    db.execute('insert into log(seq, value) values(1,?)', (passwd,))
-    db.commit()
-
-
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
     ARGS = argparse.ArgumentParser()
@@ -517,7 +498,11 @@ if __name__ == '__main__':
     if ARGS.port:
         sync(server())
     elif ARGS.passwd:
-        init(ARGS.db, ARGS.passwd)
+        db = create_schema(ARGS.db)
+        db.execute('insert into log(seq,value) values(0,?)',
+                   (uuid.uuid4().hex,))
+        db.execute('insert into log(seq,value) values(1,?)', (ARGS.passwd,))
+        db.commit()
     elif ARGS.value:
         print(sync(put(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
                        int(ARGS.version) if ARGS.version else ARGS.version)))
