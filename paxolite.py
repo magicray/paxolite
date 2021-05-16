@@ -1,7 +1,6 @@
 import os
 import time
 import hmac
-import uuid
 import fcntl
 import pickle
 import socket
@@ -436,7 +435,7 @@ async def get(servers, db, key, existing_version=0):
     return dict(status='unavailable')
 
 
-async def watch(servers, src):
+async def watch(servers, src, timeout):
     db = create_schema(src)
     seq = 2
     row = db.execute('select max(seq) from log').fetchone()
@@ -468,7 +467,7 @@ async def watch(servers, src):
                 pass
 
         if sleep:
-            time.sleep(5)
+            time.sleep(int(time.time()) % timeout)
 
 
 def sync(obj):
@@ -481,6 +480,7 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--db', dest='db', default='default')
     ARGS.add_argument('--passwd', dest='passwd')
+    ARGS.add_argument('--timeout', dest='timeout', type=int, default=5)
 
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
@@ -499,9 +499,7 @@ if __name__ == '__main__':
         sync(server())
     elif ARGS.passwd:
         db = create_schema(ARGS.db)
-        db.execute('insert into log(seq,value) values(0,?)',
-                   (uuid.uuid4().hex,))
-        db.execute('insert into log(seq,value) values(1,?)', (ARGS.passwd,))
+        db.execute('insert into log(seq,value) values(0,?)', (ARGS.passwd,))
         db.commit()
     elif ARGS.value:
         print(sync(put(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
@@ -509,4 +507,4 @@ if __name__ == '__main__':
     elif ARGS.key:
         print(sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
     else:
-        sync(watch(ARGS.servers, ARGS.db))
+        sync(watch(ARGS.servers, ARGS.db, ARGS.timeout))
