@@ -16,7 +16,7 @@ from logging import critical as log
 
 
 def create_schema(db):
-    db = sqlite3.connect('paxolite.' + db + '.sqlite3')
+    db = sqlite3.connect('kvlog.' + db + '.sqlite3')
     db.execute('''create table if not exists log(
         seq      integer primary key autoincrement,
         promised integer,
@@ -29,7 +29,7 @@ def create_schema(db):
 
 
 def paxos_promise(req, db):
-    db.execute('update log set key=0 where seq=0')
+    db.execute('insert into log(seq) values(0)')
 
     seq = req['seq']
 
@@ -56,7 +56,7 @@ def paxos_promise(req, db):
     # This is the KEY step in paxos protocol.
     db.execute('update log set promised=? where seq=?', (req['promised'], seq))
 
-    db.execute('update log set key=null where seq=0')
+    db.execute('delete from log where seq=0')
     db.commit()
 
     return dict(status='ok', accepted=row[2], key=row[3], value=row[4],
@@ -64,7 +64,7 @@ def paxos_promise(req, db):
 
 
 def paxos_accept(req, db):
-    db.execute('update log set key=0 where seq=0')
+    db.execute('insert into log(seq) values(0)')
 
     row = db.execute('select promised from log where seq=?',
                      (req['seq'],)).fetchone()
@@ -83,14 +83,14 @@ def paxos_accept(req, db):
                ''', (req['promised'], req['promised'],
                      req['key'], req.pop('value'), req['seq']))
 
-    db.execute('update log set key=null where seq=0')
+    db.execute('delete from log where seq=0')
     db.commit()
 
     return dict(status='ok')
 
 
 def paxos_learn(req, db):
-    db.execute('update log set key=0 where seq=0')
+    db.execute('insert into log(seq) values(0)')
 
     if 'value' in req:
         db.execute('delete from log where seq=?', (req['seq'],))
@@ -100,7 +100,7 @@ def paxos_learn(req, db):
         db.execute('update log set promised=null, accepted=null where seq=?',
                    (req['seq'],))
 
-    db.execute('update log set key=null where seq=0')
+    db.execute('delete from log where seq=0')
     db.commit()
 
     return dict(status='ok')
@@ -116,7 +116,7 @@ async def paxos_propose(req, db):
         seq = req['seq']
     else:
         # Find out the next available seq number in the log
-        responses = await mrpc({s: dict(action='read_info', db=req['db'])
+        responses = await mrpc({s: dict(db=req['db'])
                                 for s in ARGS.servers})
         responses = rpc_filter('ok', responses)
 
@@ -126,9 +126,10 @@ async def paxos_propose(req, db):
         seq = max([v['next_seq'] for v in responses.values()])
 
     # Authecation - calculate HMAC of seq with the secret code
-    auth = hmac.new(
-        db.execute('select value from log where seq=0').fetchone()[0].encode(),
-        str(seq).encode(), hashlib.sha512).hexdigest()
+    with open('kvlog.' + req['db'] + '.password') as fd:
+        password = fd.read().strip()
+    auth = hmac.new(password.encode(), str(seq).encode(),
+                    hashlib.sha512).hexdigest()
 
     # Promise Phase
     responses = await mrpc({s: dict(action='promise', db=req['db'], seq=seq,
@@ -269,19 +270,27 @@ async def server():
 
     # RPC Server
     req = pickle.load(fd)
-    db = sqlite3.connect('paxolite.' + req['db'] + '.sqlite3')
 
-    if 'propose' == req['action']:
-        fcntl.flock(os.open('paxolite.propose.lock', os.O_CREAT | os.O_RDONLY),
+    try:
+        with open('kvlog.' + req['db'] + '.password') as fd:
+            password = fd.read().strip()
+    except Exception:
+        conn.sendall(pickle.dumps(dict(status='passwordmissing')))
+        return conn.close()
+
+    db = create_schema(req['db'])
+    action = req.get('action', None)
+
+    if 'propose' == action:
+        fcntl.flock(os.open('kvlog.propose.lock', os.O_CREAT | os.O_RDONLY),
                     fcntl.LOCK_EX)
         res = await paxos_propose(req, db)
         req.pop('value')
 
-    elif req['action'] in ('promise', 'accept', 'learn'):
+    elif action in ('promise', 'accept', 'learn'):
         if addr[0] in [ip for ip, port in ARGS.servers]:
             # Authecation - calculate HMAC of seq with the secret code
-            key = db.execute('select value from log where seq=0').fetchone()[0]
-            auth = hmac.new(key.encode(), str(req['seq']).encode(),
+            auth = hmac.new(password.encode(), str(req['seq']).encode(),
                             hashlib.sha512).hexdigest()
 
             if req['auth'] == auth:
@@ -293,7 +302,7 @@ async def server():
             else:
                 res = dict(status='unauthorized')
 
-    elif 'read_log' == req['action'] and req['seq'] > 1:
+    elif 'read_log' == action and req['seq'] > 0:
         row = db.execute('select * from log where seq=?',
                          (req['seq'],)).fetchone()
 
@@ -301,7 +310,7 @@ async def server():
         if row and row[1] is None and row[2] is None:
             res = dict(status='ok', key=row[3], value=row[4])
 
-    elif 'read_key' == req['action']:
+    elif 'read_key' == action:
         rows = db.execute('''select seq, promised, accepted
                              from log
                              where key=? order by seq desc
@@ -313,18 +322,16 @@ async def server():
                 res = dict(status='ok', seq=row[0])
                 break
 
-    elif 'read_info' == req['action']:
+    else:
         row = db.execute('''select seq, promised, accepted from log
                             order by seq desc limit 1
                          ''').fetchone()
-
-        res = dict(status='ok', next_seq=row[0])
-
-        if row[1] is None and row[2] is None:
-            res['next_seq'] = row[0] + 1
-
-    else:
-        res = dict(status='notallowed')
+        if not row:
+            res = dict(status='ok', next_seq=1)
+        elif row and row[1] is None and row[2] is None:
+            res = dict(status='ok', next_seq=row[0]+1)
+        else:
+            res = dict(status='ok', next_seq=row[0])
 
     req.update(res)
     conn.sendall(pickle.dumps(req))
@@ -338,7 +345,7 @@ async def server():
         if 'learn' != req['action']:
             return
 
-        fcntl.flock(os.open('paxolite.repair.lock', os.O_CREAT | os.O_RDONLY),
+        fcntl.flock(os.open('kvlog.repair.lock', os.O_CREAT | os.O_RDONLY),
                     fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         # Fix inconsistencies in the log
@@ -357,12 +364,12 @@ async def rpc(server, req):
     res = pickle.loads((await reader.read()))
     writer.close()
 
-    tmp = res.copy()
-    tmp.pop('auth', None)
-    tmp.pop('value', None)
-    log('server%s %s', server, tmp)
+    # tmp = res.copy()
+    # tmp.pop('auth', None)
+    # tmp.pop('value', None)
+    # log('server%s %s', server, tmp)
 
-    res['server'] = server
+    res['__server__'] = server
     return res
 
 
@@ -372,7 +379,7 @@ async def mrpc(server_req_map):
     responses = dict()
     for res in await asyncio.gather(*tasks, return_exceptions=True):
         if type(res) is dict:
-            responses[res['server']] = res
+            responses[res.pop('__server__')] = res
 
     return responses
 
@@ -381,7 +388,7 @@ def rpc_filter(status, responses):
     return {k: v for k, v in responses.items() if v['status'] == status}
 
 
-async def put(servers, db, value, key=None, version=0):
+async def append(servers, db, value, key=None, version=0):
     # This requires some explanation.
     #
     # We want only one server to drive the writes, as conflicts in
@@ -435,16 +442,14 @@ async def get(servers, db, key, existing_version=0):
     return dict(status='unavailable')
 
 
-async def watch(servers, src, timeout):
+async def pull(servers, src):
     db = create_schema(src)
-    seq = 2
-    row = db.execute('select max(seq) from log').fetchone()
+    seq = db.execute('select max(seq) from log').fetchone()[0]
+    seq = (seq if seq else 0) + 1
 
-    if row[0]:
-        seq = row[0] + 1
-
-    while True:
-        sleep = True
+    flag = True
+    while flag:
+        flag = False
 
         for i in range(len(servers)):
             try:
@@ -461,13 +466,10 @@ async def watch(servers, src, timeout):
                         len(r['value'])))
 
                     seq += 1
-                    sleep = False
+                    flag = True
                     break
             except Exception:
                 pass
-
-        if sleep:
-            time.sleep(int(time.time()) % timeout)
 
 
 def sync(obj):
@@ -479,8 +481,7 @@ if __name__ == '__main__':
     ARGS = argparse.ArgumentParser()
 
     ARGS.add_argument('--db', dest='db', default='default')
-    ARGS.add_argument('--passwd', dest='passwd')
-    ARGS.add_argument('--timeout', dest='timeout', type=int, default=5)
+    ARGS.add_argument('--pull', dest='pull', type=int)
 
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
@@ -495,16 +496,24 @@ if __name__ == '__main__':
     ARGS.servers = [(s.split(':')[0].strip(), int(s.split(':')[1]))
                     for s in ARGS.servers.split(',')]
 
-    if ARGS.port:
-        sync(server())
-    elif ARGS.passwd:
-        db = create_schema(ARGS.db)
-        db.execute('insert into log(seq,value) values(0,?)', (ARGS.passwd,))
-        db.commit()
-    elif ARGS.value:
-        print(sync(put(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
-                       int(ARGS.version) if ARGS.version else ARGS.version)))
+    if ARGS.value:
+        print(sync(append(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
+                          int(ARGS.version) if ARGS.version else ARGS.version)))
     elif ARGS.key:
         print(sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
+    elif ARGS.port:
+        sync(server())
+    elif ARGS.pull is not None:
+        while True:
+            sync(pull(ARGS.servers, ARGS.db))
+
+            if 0 == ARGS.pull:
+                break
+
+            time.sleep(ARGS.pull)
     else:
-        sync(watch(ARGS.servers, ARGS.db, ARGS.timeout))
+        responses = sync(mrpc({s: dict(db=ARGS.db) for s in ARGS.servers}))
+        for srv in ARGS.servers:
+            res = responses.get(srv, {})
+            print('server{} next_seq({})'.format(
+                srv, res.get('next_seq', None)))
