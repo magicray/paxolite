@@ -20,10 +20,10 @@ def create_schema(db):
 
     # Columns in the log table map to paxos in the following manner
     #
-    # PAXOS key          -> COLUMN seq 
-    # PAXOS promise seq  -> COLUMN promised 
-    # PAXOS accept seq   -> COLUMN accepted 
-    # PAXOS value        -> COLUMN key, value 
+    # PAXOS key          -> COLUMN seq
+    # PAXOS promise seq  -> COLUMN promised
+    # PAXOS accept seq   -> COLUMN accepted
+    # PAXOS value        -> COLUMN key, value
     #
     # During paxos round, promised/accepted have positive integer seq,
     # finally, these are set to null to indicate that this row is learnt.
@@ -309,15 +309,15 @@ async def server():
         # Authecation - calculate HMAC of nsec with the secret code
         nsec = req['auth'][0]
         auth = hmac.new(password.encode(), str(nsec).encode(),
-                            hashlib.sha512).digest()
+                        hashlib.sha512).digest()
 
         ts = time.time()
         authorized = auth == req['auth'][1] and ts-30 < int(nsec/10**9) < ts+30
 
     if 'propose' == action:
         if authorized:
-            fcntl.flock(os.open('kvlog.propose.lock', os.O_CREAT | os.O_RDONLY),
-                        fcntl.LOCK_EX)
+            fcntl.flock(os.open('kvlog.' + req['db'] + '.propose.lock',
+                        os.O_CREAT | os.O_RDONLY), fcntl.LOCK_EX)
             res = await paxos_propose(req, db)
             req.pop('value')
         else:
@@ -386,8 +386,8 @@ async def server():
         if 'learn' != req['action']:
             return
 
-        fcntl.flock(os.open('kvlog.repair.lock', os.O_CREAT | os.O_RDONLY),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(os.open('kvlog.' + req['db'] + '.repair.lock',
+                    os.O_CREAT | os.O_RDONLY), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         # Fix inconsistencies in the log
         await repair_log(req, db)
@@ -429,7 +429,7 @@ def rpc_filter(status, responses):
     return {k: v for k, v in responses.items() if v['status'] == status}
 
 
-async def append(servers, db, value, key=None, version=0):
+async def put(servers, db, value, key=None, version=0):
     # We want only one server to drive the writes, as conflicts in
     # paxos rounds lead to live-lock like situation, significantly
     # delaying writes. We try servers in a fixed sequence, to ensure
@@ -537,8 +537,8 @@ if __name__ == '__main__':
                     for s in ARGS.servers.split(',')]
 
     if ARGS.value:
-        print(sync(append(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
-                          int(ARGS.version) if ARGS.version else ARGS.version)))
+        print(sync(put(ARGS.servers, ARGS.db, ARGS.value.encode(), ARGS.key,
+                       int(ARGS.version) if ARGS.version else ARGS.version)))
     elif ARGS.key:
         print(sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
     elif ARGS.pull is not None:
