@@ -17,6 +17,22 @@ from logging import critical as log
 
 def create_schema(db):
     db = sqlite3.connect('kvlog.' + db + '.sqlite3')
+
+    # Columns in the log table map to paxos in the following manner
+    #
+    # Paxos KEY         -> seq
+    # Paxos PROMISE SEQ -> promised
+    # Paxos ACCEPT SEQ  -> accepted
+    # Paxos VALUE       -> key, value
+    #
+    # During paxos round, promised/accepted have positive integer seq,
+    # finally, these are set to null to indicate that this row is learnt.
+    # This row would never participate in any future paxos round.
+    #
+    # Paxos promise phase needs to specify the key. To get that, we have
+    # a pre paxos round to find out the max seq entry. If that entry is
+    # already learnt than seq+1 is the PAXOS KEY for the next round, else
+    # seq is used to conclude the abandoned or in progress round.
     db.execute('''create table if not exists log(
         seq      integer primary key autoincrement,
         promised integer,
@@ -123,7 +139,7 @@ async def paxos_propose(req, db):
         if len(responses) < quorum:
             return dict(status='NoInfoQuorum')
 
-        seq = max([v['next_seq'] for v in responses.values()])
+        seq = max([v['next'] for v in responses.values()])
 
     # Authecation - calculate HMAC of seq with the secret code
     with open('kvlog.' + req['db'] + '.password') as fd:
@@ -302,6 +318,10 @@ async def server():
             else:
                 res = dict(status='unauthorized')
 
+    elif 'drop_log' == action:
+        row = db.execute('delete from log where seq<?', (req['seq'],))
+        db.commit()
+        res = dict(status='ok')
     elif 'read_log' == action and req['seq'] > 0:
         row = db.execute('select * from log where seq=?',
                          (req['seq'],)).fetchone()
@@ -323,15 +343,18 @@ async def server():
                 break
 
     else:
+        row = db.execute('select min(seq), max(seq) from log').fetchone()
+        res = dict(status='ok', min=row[0], max=row[1])
+
         row = db.execute('''select seq, promised, accepted from log
                             order by seq desc limit 1
                          ''').fetchone()
         if not row:
-            res = dict(status='ok', next_seq=1)
+            res['next'] = 1
         elif row and row[1] is None and row[2] is None:
-            res = dict(status='ok', next_seq=row[0]+1)
+            res['next'] = row[0]+1
         else:
-            res = dict(status='ok', next_seq=row[0])
+            res['next'] = row[0]
 
     req.update(res)
     conn.sendall(pickle.dumps(req))
@@ -482,6 +505,7 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--db', dest='db', default='default')
     ARGS.add_argument('--pull', dest='pull', type=int)
+    ARGS.add_argument('--drop', dest='drop', type=int)
 
     ARGS.add_argument('--key', dest='key')
     ARGS.add_argument('--value', dest='value')
@@ -490,7 +514,7 @@ if __name__ == '__main__':
     ARGS.add_argument('--port', dest='port', type=int)
     ARGS.add_argument('--servers', dest='servers',
                       default='127.0.0.1:5000,127.0.0.1:5001,127.0.0.1:5002,'
-                              '127.0.0.2:5003,127.0.0.1:5004')
+                              '127.0.0.1:5003,127.0.0.1:5004')
     ARGS = ARGS.parse_args()
 
     ARGS.servers = [(s.split(':')[0].strip(), int(s.split(':')[1]))
@@ -501,8 +525,6 @@ if __name__ == '__main__':
                           int(ARGS.version) if ARGS.version else ARGS.version)))
     elif ARGS.key:
         print(sync(get(ARGS.servers, ARGS.db, ARGS.key, ARGS.version)))
-    elif ARGS.port:
-        sync(server())
     elif ARGS.pull is not None:
         while True:
             sync(pull(ARGS.servers, ARGS.db))
@@ -511,9 +533,16 @@ if __name__ == '__main__':
                 break
 
             time.sleep(ARGS.pull)
+    elif ARGS.drop:
+        responses = sync(mrpc({s: dict(action='drop_log', db=ARGS.db,
+                                       seq=ARGS.drop)
+                               for s in ARGS.servers}))
+    elif ARGS.port:
+        sync(server())
     else:
         responses = sync(mrpc({s: dict(db=ARGS.db) for s in ARGS.servers}))
-        for srv in ARGS.servers:
-            res = responses.get(srv, {})
-            print('server{} next_seq({})'.format(
-                srv, res.get('next_seq', None)))
+        for srv in sorted(ARGS.servers):
+            res = responses.get(srv, dict(min='', max='', next=''))
+            print('server{} status({}) min({}) max({}) next({})'.format(
+                srv, res.get('status', ''), res['min'], res['max'],
+                res['next']))
