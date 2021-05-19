@@ -20,10 +20,10 @@ def create_schema(db):
 
     # Columns in the log table map to paxos in the following manner
     #
-    # Paxos KEY         -> seq
-    # Paxos PROMISE SEQ -> promised
-    # Paxos ACCEPT SEQ  -> accepted
-    # Paxos VALUE       -> key, value
+    # PAXOS key          -> COLUMN seq 
+    # PAXOS promise seq  -> COLUMN promised 
+    # PAXOS accept seq   -> COLUMN accepted 
+    # PAXOS value        -> COLUMN key, value 
     #
     # During paxos round, promised/accepted have positive integer seq,
     # finally, these are set to null to indicate that this row is learnt.
@@ -122,6 +122,17 @@ def paxos_learn(req, db):
     return dict(status='ok')
 
 
+# calculate HMAC of current nanosecond with the secret code
+def get_hmac(db):
+    nsec = int(time.time()*10**9)
+
+    with open('kvlog.' + db + '.password') as fd:
+        password = fd.read().strip()
+
+    return (nsec, hmac.new(password.encode(), str(nsec).encode(),
+                           hashlib.sha512).digest())
+
+
 async def paxos_propose(req, db):
     quorum = int(len(ARGS.servers)/2) + 1
 
@@ -141,11 +152,7 @@ async def paxos_propose(req, db):
 
         seq = max([v['next'] for v in responses.values()])
 
-    # Authecation - calculate HMAC of seq with the secret code
-    with open('kvlog.' + req['db'] + '.password') as fd:
-        password = fd.read().strip()
-    auth = hmac.new(password.encode(), str(seq).encode(),
-                    hashlib.sha512).hexdigest()
+    auth = get_hmac(req['db'])
 
     # Promise Phase
     responses = await mrpc({s: dict(action='promise', db=req['db'], seq=seq,
@@ -297,31 +304,42 @@ async def server():
     db = create_schema(req['db'])
     action = req.get('action', None)
 
+    authorized = False
+    if 'auth' in req:
+        # Authecation - calculate HMAC of nsec with the secret code
+        nsec = req['auth'][0]
+        auth = hmac.new(password.encode(), str(nsec).encode(),
+                            hashlib.sha512).digest()
+
+        ts = time.time()
+        authorized = auth == req['auth'][1] and ts-30 < int(nsec/10**9) < ts+30
+
     if 'propose' == action:
-        fcntl.flock(os.open('kvlog.propose.lock', os.O_CREAT | os.O_RDONLY),
-                    fcntl.LOCK_EX)
-        res = await paxos_propose(req, db)
-        req.pop('value')
+        if authorized:
+            fcntl.flock(os.open('kvlog.propose.lock', os.O_CREAT | os.O_RDONLY),
+                        fcntl.LOCK_EX)
+            res = await paxos_propose(req, db)
+            req.pop('value')
+        else:
+            res = dict(status='unauthorized')
 
     elif action in ('promise', 'accept', 'learn'):
-        if addr[0] in [ip for ip, port in ARGS.servers]:
-            # Authecation - calculate HMAC of seq with the secret code
-            auth = hmac.new(password.encode(), str(req['seq']).encode(),
-                            hashlib.sha512).hexdigest()
-
-            if req['auth'] == auth:
-                res = dict(
-                    learn=paxos_learn,
-                    accept=paxos_accept,
-                    promise=paxos_promise,
-                )[req['action']](req, db)
-            else:
-                res = dict(status='unauthorized')
+        if addr[0] in [ip for ip, port in ARGS.servers] and authorized:
+            res = dict(
+                learn=paxos_learn,
+                accept=paxos_accept,
+                promise=paxos_promise,
+            )[req['action']](req, db)
+        else:
+            res = dict(status='unauthorized')
 
     elif 'drop_log' == action:
-        row = db.execute('delete from log where seq<?', (req['seq'],))
-        db.commit()
-        res = dict(status='ok')
+        if authorized:
+            row = db.execute('delete from log where seq<?', (req['seq'],))
+            db.commit()
+            res = dict(status='ok')
+        else:
+            res = dict(status='unauthorized')
     elif 'read_log' == action and req['seq'] > 0:
         row = db.execute('select * from log where seq=?',
                          (req['seq'],)).fetchone()
@@ -412,8 +430,6 @@ def rpc_filter(status, responses):
 
 
 async def append(servers, db, value, key=None, version=0):
-    # This requires some explanation.
-    #
     # We want only one server to drive the writes, as conflicts in
     # paxos rounds lead to live-lock like situation, significantly
     # delaying writes. We try servers in a fixed sequence, to ensure
@@ -425,8 +441,8 @@ async def append(servers, db, value, key=None, version=0):
 
     for _, s in sorted(srvs):
         try:
-            res = await rpc(s, dict(action='propose', db=db, key=key,
-                                    version=version, value=value))
+            res = await rpc(s, dict(action='propose', db=db, auth=get_hmac(db),
+                                    key=key, version=version, value=value))
 
             if 'ok' != res['status']:
                 return dict(status=res['status'])
